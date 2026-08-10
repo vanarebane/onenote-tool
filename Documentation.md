@@ -1,7 +1,7 @@
 # Documentation
 
 Full reference for the `onenote-tool` library and CLI. For a quick
-overview, see [README.md](README.md).
+overview, see [README.md](https://github.com/vanarebane/onenote-tool/blob/main/README.md).
 
 ## Contents
 
@@ -25,7 +25,7 @@ pip install onenote-tool[dev]     # + pytest/ruff, for working on this repo itse
 
 Core runtime dependencies: `pyOneNote` (does the low-level MS-ONESTORE
 binary parsing this package patches heavily — see
-[docs/knowledge/onenote-file-format.md](docs/knowledge/onenote-file-format.md)),
+[docs/knowledge/onenote-file-format.md](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/onenote-file-format.md)),
 `Pillow` (image decode/resize/hashing), `cryptography` (AES for
 password-protected sections).
 
@@ -73,7 +73,7 @@ title, block kinds, and image/file counts, plus the full element report.
 
 Environment diagnostic: confirms `pyOneNote` imported and got patched
 successfully, prints dependency versions, warns if you're not on Windows
-(see [known limitations](docs/knowledge/known-limitations.md)). Run this
+(see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)). Run this
 first when something doesn't work.
 
 ## Python API reference
@@ -228,7 +228,7 @@ canvas: it hands you the content, in the order OneNote itself stores it,
 and leaves layout entirely to you. If your application wants OneNote's
 original floating-box positions, canvas coordinates aren't currently
 exposed by this library at all — see
-[known limitations](docs/knowledge/known-limitations.md).
+[known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md).
 
 An image or file block's `html` (`<img src="...">` for images; a list of
 `<p>📎 <a href="...">name</a></p>` links for `file_links`) references its
@@ -240,7 +240,7 @@ block's `html` is enough; the token is unique per page).
 
 An `'ink'` block's `html` is a self-contained inline `<svg>...</svg>`
 fragment (see
-[docs/knowledge/onenote-file-format.md](docs/knowledge/onenote-file-format.md)
+[docs/knowledge/onenote-file-format.md](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/onenote-file-format.md)
 for how ink strokes are decoded) — there's nothing else to extract from it.
 
 ## Password handling
@@ -255,7 +255,7 @@ for how ink strokes are decoded) — there's nothing else to extract from it.
   it's reused automatically for the other two.
 - Passwords are used purely in memory, for the duration of one parse call,
   to derive an AES key (see
-  [docs/knowledge/ms-offcrypto-encryption.md](docs/knowledge/ms-offcrypto-encryption.md)) —
+  [docs/knowledge/ms-offcrypto-encryption.md](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/ms-offcrypto-encryption.md)) —
   this library never logs, stores, or transmits a password anywhere itself.
 - `password_status` values:
   - `None` — not protected, or successfully decrypted.
@@ -269,7 +269,7 @@ for how ink strokes are decoded) — there's nothing else to extract from it.
 Content recovery for a protected section is inherently more limited than
 for a normal one — see [the progress table](#development--testing-progress)
 below and
-[docs/knowledge/recovery-techniques-log.md](docs/knowledge/recovery-techniques-log.md)
+[docs/knowledge/recovery-techniques-log.md](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/recovery-techniques-log.md)
 for exactly what is and isn't recoverable and why.
 
 ## Progress-flow contract
@@ -326,7 +326,7 @@ timeout/cancellation policy).
   given something that isn't a `.one` file at all.
 - `RuntimeError` from `unpack_onepkg`/CAB extraction — needs `expand.exe`
   (Windows) or `cabextract` (Linux/macOS) on `PATH`; see
-  [known limitations](docs/knowledge/known-limitations.md).
+  [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md).
 - A single section failing to parse (a genuine bug, corrupt data, or a
   pyOneNote limitation like an unimplemented property type) does **not**
   abort the whole notebook — `process_sections` catches it, records
@@ -344,14 +344,14 @@ timeout/cancellation policy).
 - **Not thread-safe, not reentrant.** `parse_one_file` coordinates a
   password-verified re-parse through a small number of module-level
   single-slot variables (see
-  [docs/knowledge/ms-offcrypto-encryption.md](docs/knowledge/ms-offcrypto-encryption.md)).
+  [docs/knowledge/ms-offcrypto-encryption.md](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/ms-offcrypto-encryption.md)).
   This is safe for the intended use (parse one file at a time, one call at
   a time) but **not** safe to call concurrently from multiple threads or
   async tasks in the same process. Use multiple processes if you need
   concurrency.
 - **Importing `onenote_tool` monkeypatches `pyOneNote` process-wide**, as a
   side effect of import, to fix real bugs and gaps in that library (see
-  [docs/knowledge/onenote-file-format.md](docs/knowledge/onenote-file-format.md)).
+  [docs/knowledge/onenote-file-format.md](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/onenote-file-format.md)).
   If your process imports `pyOneNote` directly for something else too, it
   will observe these patches as well.
 - `pyOneNote` is version-**pinned** in `pyproject.toml` (not a `>=` range):
@@ -364,7 +364,7 @@ timeout/cancellation policy).
 
 This is an early-stage tool built by reverse-engineering an undocumented
 binary format against real files (see
-[docs/knowledge/recovery-techniques-log.md](docs/knowledge/recovery-techniques-log.md)
+[docs/knowledge/recovery-techniques-log.md](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/recovery-techniques-log.md)
 for the full trail). The table below tracks what's actually been verified,
 not what's aspirational.
 

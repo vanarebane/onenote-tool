@@ -8,7 +8,7 @@ Microsoft's own tooling doesn't expose.
 This is **not** an official Microsoft project, and it is **lossy by
 design**: OneNote's binary format ([MS-ONESTORE]) is large, partly
 undocumented, and this tool reads what it can, reports what it can't, and
-never claims perfect fidelity. See [Documentation.md](Documentation.md) for
+never claims perfect fidelity. See [Documentation.md](https://github.com/vanarebane/onenote-tool/blob/main/Documentation.md) for
 exactly what's currently supported.
 
 ## What it's for
@@ -25,7 +25,7 @@ exactly what's currently supported.
 
 It is explicitly **not** trying to be a pixel-perfect OneNote renderer —
 the output is deliberately generic (see "The `blocks` format" in
-[Documentation.md](Documentation.md)) so that a consuming application does
+[Documentation.md](https://github.com/vanarebane/onenote-tool/blob/main/Documentation.md)) so that a consuming application does
 its own layout/styling, rather than this library making that decision for
 everyone.
 
@@ -36,14 +36,15 @@ pip install onenote-tool          # library only
 pip install onenote-tool[cli]     # + the `onenote-tool` command-line tool
 ```
 
-(Not yet published to PyPI — see [docs/knowledge/known-limitations.md](docs/knowledge/known-limitations.md)
-for current status. For now, install from a local clone: `pip install -e ".[cli,dev]"`.)
+Published on [PyPI](https://pypi.org/project/onenote-tool/). See
+[docs/knowledge/known-limitations.md](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)
+for current status. To install from a local clone instead: `pip install -e ".[cli,dev]"`.
 
 **Platform note:** unpacking a `.onepkg` (a CAB archive) uses Windows'
 `expand.exe` when present, otherwise falls back to the `cabextract` CLI
 (install via `apt`/`brew`/`dnf`) on Linux/macOS. Run `onenote-tool doctor`
 to check which one it found. See
-[docs/knowledge/known-limitations.md](docs/knowledge/known-limitations.md).
+[docs/knowledge/known-limitations.md](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md).
 
 ## Quick start — CLI
 
@@ -68,7 +69,7 @@ for section in result.sections:
         print(" ", page.title, [b["kind"] for b in page.blocks])
 ```
 
-See [Documentation.md](Documentation.md) for the full API/CLI reference,
+See [Documentation.md](https://github.com/vanarebane/onenote-tool/blob/main/Documentation.md) for the full API/CLI reference,
 the `blocks` format contract, how passwords are handled, and the
 progress-reporting flow for a caller that wants to show live conversion
 progress (e.g. a web backend importing a large notebook).
@@ -76,11 +77,11 @@ progress (e.g. a web backend importing a large notebook).
 ## Learning how this works
 
 If you're picking up development on this project, start with
-[docs/knowledge/](docs/knowledge/) — it has everything that was reverse
+[docs/knowledge/](https://github.com/vanarebane/onenote-tool/tree/main/docs/knowledge/) — it has everything that was reverse
 engineered to make this possible (the file format, the encryption scheme,
 and a chronological log of what was tried and what actually worked), so you
 don't have to re-derive it.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](https://github.com/vanarebane/onenote-tool/blob/main/LICENSE).
