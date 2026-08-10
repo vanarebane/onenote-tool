@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+
+# Never commit real notebook exports — they can contain personal content.
+# Drop your own local test files under tests/fixtures/ (see its README.md);
+# this ignore rule keeps them out of git no matter where they land.
+tests/fixtures/*
+!tests/fixtures/README.md
+*.onepkg
+*.one
+*.onex
