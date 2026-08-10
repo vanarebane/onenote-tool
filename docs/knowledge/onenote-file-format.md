@@ -152,40 +152,29 @@ takes, both confirmed against real files:
   This is the harder case, and not fully solved — see the same log for
   what was tried.
 
-This isn't only a password-protected-recovery problem — it reaches the
-**main, unprotected pipeline** too, via two more shapes confirmed against a
-real (unprotected) `.one` file:
+This isn't only a password-protected-recovery problem — the manifest tree
+(`ordering._page_content_order`'s tree walk, used for content order/title
+detection) has its own revision-store failure mode: a stale, superseded
+`jcidPageManifestNode` generation can structurally claim (via its own
+child-reference properties) content that legitimately belongs to a
+different, current page's manifest.
 
-- **A run's own reference can target a stale sibling generation.** Page
-  grouping (`parser._run_guid`) keys off the object-space `ExtendedGUID`
-  embedded in a run's own `TextRunFormatting` property. Normally every run on
-  a page agrees on that guid — but one run (observed: the one carrying
-  highlight-colour formatting) can have a `TextRunFormatting` that instead
-  references a *different*, title-less object-space than every other run on
-  the same page (confirmed correct by the page's own manifest tree,
-  `ordering._page_content_order`). Grouping by `_run_guid` alone silently
-  split what the manifest tree agrees is one page into a titled remainder
-  plus a title-less orphan carrying just that one run (and, via
-  `current_guid` propagation, any images/tables/ink that immediately
-  followed it in file order) — reproducible on **three separately-exported
-  copies of the same notebook**, each splitting differently depending on
-  where the scrambled revision-store storage order happened to place things.
-  **Fixed**: `parser.parse_one_file` now computes, per page (as identified by
-  the manifest tree), the `_run_guid` value its non-title body runs actually
-  agree on (the "consensus"); a run whose own `_run_guid` disagrees with its
-  page's consensus is corrected to the consensus instead of trusted as-is.
-  Deliberately narrow — a page with no body runs to form a consensus from
-  (e.g. one that's just a title) is left exactly as `_run_guid` alone would
-  group it, because the manifest tree has its own failure mode too (below),
-  and blindly preferring it over an already-correct `_run_guid` regressed
-  real pages on a real file before this was narrowed down.
-- **The manifest tree itself is not immune.** A stale, superseded
-  `jcidPageManifestNode` generation can structurally claim (via its own
-  child-reference properties) content that legitimately belongs to the
-  current generation's manifest — i.e. the tree walk can be just as wrong as
-  `_run_guid`, in the opposite direction. This is why the fix above only
-  ever *corrects an outlier against its own siblings' consensus*, and never
-  blindly substitutes the tree's page-guid for `_run_guid`'s.
+**Tried and reverted (0.1.1)**: an earlier version had `parser.parse_one_file`
+trust that tree walk to override a run's own `_run_guid` (its
+`TextRunFormatting`-derived object-space guid) whenever the two disagreed,
+reasoning that the tree was the more authoritative signal for "which page is
+this run really on." A/B testing against the verified-working pre-extraction
+code on a real notebook found the opposite: the tree walk's own failure mode
+above made it claim a run that belonged to a genuinely separate page,
+silently **dropping that page entirely** from the output (not just
+misattributing a run — the whole page, title included, vanished). See
+[known-limitations.md](known-limitations.md) for the full account. Current
+behavior (matches the verified baseline): group a run purely by its own
+`_run_guid`, no tree-based override. `ordering._page_content_order`'s walk
+also deliberately uses a narrower child-key set (`_CONTENT_CHILD_KEYS`) than
+`_object_space_order`'s (`_ORDER_CHILD_KEYS`) — widening it to match was
+part of what let the walk cross into the wrong page's subtree.
+
 - **Still open: which title snapshot is current.** Page titles have the same
   duplication problem `page_title_by_guid` doesn't yet resolve: a renamed
   page can leave both its old and new `CachedTitleString` snapshots in the

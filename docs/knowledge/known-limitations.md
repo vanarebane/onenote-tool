@@ -68,20 +68,9 @@ knowing if you're debugging something that touches `pyOneNote` directly.
 ## Revision-store duplication can misattribute content, even unprotected
 
 OneNote's revision-store duplication (see
-[onenote-file-format.md](onenote-file-format.md)) was previously documented
-as a password-protected-recovery-only concern. It isn't — verified on a real
-notebook, reproduced across **three separately-exported copies of the same
-section**, each corrupted differently:
+[onenote-file-format.md](onenote-file-format.md)) reaches the main,
+unprotected pipeline too, via `page_title_by_guid`'s title dedup:
 
-- **Fixed**: a run whose own `TextRunFormatting` reference pointed at a
-  stale, title-less object-space instead of the guid every other run on the
-  same page (confirmed by the page's own manifest tree) agreed on — this
-  silently split one page into a titled remainder plus a title-less orphan
-  page carrying that one run and whatever images/tables/ink immediately
-  followed it in file order. `parser.parse_one_file` now corrects a run
-  against its own page's sibling consensus when the two disagree (see
-  [onenote-file-format.md](onenote-file-format.md) for the exact mechanism
-  and why it's deliberately narrow).
 - **Still open**: a renamed page can leave both its old and new title text
   in the file under the exact same identity tuple, with no reliable signal
   to tell which is current — `page_title_by_guid`'s first-occurrence-wins
@@ -90,6 +79,29 @@ section**, each corrupted differently:
   needed the *first* occurrence, not the last) was found on the same test
   file this was investigated against, ruling out a blind
   first-wins-to-last-wins flip.
+
+**Tried and reverted (0.1.1): a "sibling consensus" run-grouping override.**
+An earlier version of this package (0.1.0) had `parser.parse_one_file` build
+a per-page "consensus" object-space guid from the manifest tree
+(`ordering._page_content_order`'s tree walk, widened to also track which
+page-manifest each run was reached under) and used it to override a run's
+own `TextRunFormatting`-derived guid whenever the two disagreed — intended
+to fix a run whose formatting reference pointed at a stale sibling
+generation. It was never actually verified against a real file before
+shipping: A/B testing 0.1.0 against the pre-extraction, verified-working
+homeos code on the same real notebook found it introduced a **real
+regression** — the manifest tree's own widened child-key walk (see
+`ordering._CONTENT_CHILD_KEYS` vs `_ORDER_CHILD_KEYS`) could cross into a
+neighboring page's subtree via a stale revision-store reference and claim a
+run that legitimately belonged to its own, separate page, silently
+**dropping that page entirely** (confirmed: a real "― George Carlin" quote
+page vanished from a test notebook's output). Reverted in 0.1.1 to the
+original, verified mechanism: group a run purely by its own `_run_guid`
+(`TextRunFormatting`), no tree-consensus override. If a stale-sibling-
+formatting-reference bug like the one 0.1.0 tried to fix is ever confirmed
+again, verify any fix with a full page-count/title diff against a known-good
+baseline on a real file before landing it — this one shipped on reasoning
+alone and broke something worse than what it fixed.
 
 ## Password-protected recovery has a real, not-yet-closed ceiling
 

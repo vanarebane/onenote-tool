@@ -12,11 +12,24 @@ _TITLE_TYPES = {'jcidTitleNode'}
 _TABLE_TYPES = {'jcidTableNode'}
 _TABLE_PART_TYPES = {'jcidTableRowNode', 'jcidTableCellNode'}
 
-# Ordered child-reference lists, walked to reconstruct a page's visual content
-# order (pyOneNote emits properties in storage order, not top-to-bottom order).
+# Ordered child-reference lists, walked to reconstruct the SECTION's page order
+# (_object_space_order) — deliberately a wider key set than _CONTENT_CHILD_KEYS
+# below, since a section/page-series node's own children use different keys
+# than a page manifest's content tree does.
 _ORDER_CHILD_KEYS = (
     'ContentChildNodesOfPageManifest', 'ElementChildNodesOfVersionHistory',
     'StructureElementChildNodes', 'OutlineElementChildNodes', 'ContentChildNodes',
+)
+
+# Child-reference keys walked for a PAGE's own content order/title detection
+# (_page_content_order). Deliberately narrower than _ORDER_CHILD_KEYS above —
+# including 'OutlineElementChildNodes'/'ContentChildNodes' here was tried and
+# reverted: it let the walk cross into a neighboring page's subtree (a stale
+# revision-store reference, see onenote-file-format.md's duplication section)
+# and mis-claim a run that legitimately belonged to its own, separate page —
+# confirmed against a real file, where it silently dropped a whole page.
+_CONTENT_CHILD_KEYS = (
+    'ElementChildNodesOfVersionHistory', 'ContentChildNodesOfPageManifest', 'StructureElementChildNodes',
 )
 
 
@@ -89,27 +102,28 @@ def _object_space_order(document, props, by_id):
     return {oid: gosid_order[gs] for oid, gs in oid_to_gosid.items() if gs in gosid_order}
 
 
+def _content_child_ids(prop) -> list:
+    out = []
+    val = prop.get('val', {}) if prop else {}
+    for key in _CONTENT_CHILD_KEYS:
+        refs = val.get(key)
+        if isinstance(refs, list):
+            out.extend(_norm_identity(r) for r in refs)
+        elif refs:
+            out.append(_norm_identity(refs))
+    return [x for x in out if x]
+
+
 def _page_content_order(props, by_id):
     """Walk each page's manifest tree in child order to recover the real visual
     order of its text runs, and flag runs that sit under the TitleNode (the page
-    title, not body). Also records which page-manifest guid each run was
-    actually reached under while walking (`run_page`) — the authoritative,
-    containment-based answer to "which page is this run on", independent of
-    a run's own `TextRunFormatting` reference (see `parser._run_guid`), which
-    can point at a stale/orphan object-space for a run whose formatting object
-    happens to sit in a different revision generation than its siblings (a
-    real bug: a highlighted-colour run's own guid never matched its page's
-    guid, splitting one page into two — a titled one and a title-less orphan
-    — even though the manifest tree correctly has it as one page throughout).
-    Returns (order_index{run_id: seq}, title_run_ids, run_page{run_id: page_guid}).
-    """
+    title, not body). Returns (order_index{run_id: seq}, title_run_ids)."""
     order = {}
     title_ids = set()
     counter = [0]
     seen = set()
-    run_page = {}
 
-    def walk(nid, in_title, page_guid):
+    def walk(nid, in_title):
         if not nid or nid in seen:
             return
         seen.add(nid)
@@ -120,8 +134,6 @@ def _page_content_order(props, by_id):
         if t in _TABLE_TYPES or t in _TABLE_PART_TYPES:
             return  # tables + their cell runs are handled/consumed separately
         if t == 'jcidRichTextOENode':
-            if page_guid:
-                run_page[nid] = page_guid
             if in_title:
                 title_ids.add(nid)
             elif nid not in order:
@@ -129,12 +141,10 @@ def _page_content_order(props, by_id):
                 counter[0] += 1
             return
         deeper = in_title or (t in _TITLE_TYPES)
-        for child in _ordered_child_ids(p):
-            walk(child, deeper, page_guid)
+        for child in _content_child_ids(p):
+            walk(child, deeper)
 
     for p in props:
         if p.get('type', '') == 'jcidPageManifestNode':
-            root_id = _norm_identity(p.get('identity'))
-            page_guid = (root_id or '').split(',')[0] or None
-            walk(root_id, False, page_guid)
-    return order, title_ids, run_page
+            walk(_norm_identity(p.get('identity')), False)
+    return order, title_ids
