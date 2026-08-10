@@ -92,13 +92,24 @@ def _object_space_order(document, props, by_id):
 def _page_content_order(props, by_id):
     """Walk each page's manifest tree in child order to recover the real visual
     order of its text runs, and flag runs that sit under the TitleNode (the page
-    title, not body). Returns (order_index{run_id: seq}, title_run_ids)."""
+    title, not body). Also records which page-manifest guid each run was
+    actually reached under while walking (`run_page`) — the authoritative,
+    containment-based answer to "which page is this run on", independent of
+    a run's own `TextRunFormatting` reference (see `parser._run_guid`), which
+    can point at a stale/orphan object-space for a run whose formatting object
+    happens to sit in a different revision generation than its siblings (a
+    real bug: a highlighted-colour run's own guid never matched its page's
+    guid, splitting one page into two — a titled one and a title-less orphan
+    — even though the manifest tree correctly has it as one page throughout).
+    Returns (order_index{run_id: seq}, title_run_ids, run_page{run_id: page_guid}).
+    """
     order = {}
     title_ids = set()
     counter = [0]
     seen = set()
+    run_page = {}
 
-    def walk(nid, in_title):
+    def walk(nid, in_title, page_guid):
         if not nid or nid in seen:
             return
         seen.add(nid)
@@ -109,6 +120,8 @@ def _page_content_order(props, by_id):
         if t in _TABLE_TYPES or t in _TABLE_PART_TYPES:
             return  # tables + their cell runs are handled/consumed separately
         if t == 'jcidRichTextOENode':
+            if page_guid:
+                run_page[nid] = page_guid
             if in_title:
                 title_ids.add(nid)
             elif nid not in order:
@@ -117,9 +130,11 @@ def _page_content_order(props, by_id):
             return
         deeper = in_title or (t in _TITLE_TYPES)
         for child in _ordered_child_ids(p):
-            walk(child, deeper)
+            walk(child, deeper, page_guid)
 
     for p in props:
         if p.get('type', '') == 'jcidPageManifestNode':
-            walk(_norm_identity(p.get('identity')), False)
-    return order, title_ids
+            root_id = _norm_identity(p.get('identity'))
+            page_guid = (root_id or '').split(',')[0] or None
+            walk(root_id, False, page_guid)
+    return order, title_ids, run_page

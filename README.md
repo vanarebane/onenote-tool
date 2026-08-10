@@ -39,8 +39,10 @@ pip install onenote-tool[cli]     # + the `onenote-tool` command-line tool
 (Not yet published to PyPI — see [docs/knowledge/known-limitations.md](docs/knowledge/known-limitations.md)
 for current status. For now, install from a local clone: `pip install -e ".[cli,dev]"`.)
 
-**Platform note:** unpacking a `.onepkg` (a CAB archive) currently requires
-Windows (`expand.exe`). See
+**Platform note:** unpacking a `.onepkg` (a CAB archive) uses Windows'
+`expand.exe` when present, otherwise falls back to the `cabextract` CLI
+(install via `apt`/`brew`/`dnf`) on Linux/macOS. Run `onenote-tool doctor`
+to check which one it found. See
 [docs/knowledge/known-limitations.md](docs/knowledge/known-limitations.md).
 
 ## Quick start — CLI

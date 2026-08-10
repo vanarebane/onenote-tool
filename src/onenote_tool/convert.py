@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import subprocess
 import tempfile
 from typing import Optional
@@ -21,20 +22,38 @@ from .rendering import _placeholder_blocks
 log = logging.getLogger(__name__)
 
 
-def _expand_onepkg(onepkg_path: str, out_dir: str) -> None:
-    """Unpack a .onepkg CAB archive into out_dir using Windows expand.exe.
+def _find_expand_exe() -> Optional[str]:
+    candidate = os.path.join(os.environ.get('WINDIR', r'C:\Windows'), 'System32', 'expand.exe')
+    if os.path.exists(candidate):
+        return candidate
+    return shutil.which('expand.exe') or shutil.which('expand')
 
-    See docs/knowledge/known-limitations.md — this is currently the one
-    genuinely Windows-only part of the package; a Linux/macOS caller needs
-    `cabextract`/`libmspack` wired in here instead (not yet done).
+
+def _expand_onepkg(onepkg_path: str, out_dir: str) -> None:
+    """Unpack a .onepkg CAB archive into out_dir.
+
+    Prefers Windows' built-in `expand.exe` when it's present (also covers
+    Cygwin/WSL setups that expose it on PATH), and falls back to the
+    cross-platform `cabextract` CLI (wraps libmspack; `apt`/`brew`/`dnf`
+    package `cabextract`) so Linux/macOS work without any Windows tooling.
+    Both extract the CAB preserving its internal directory structure, which
+    `unpack_onepkg` relies on for OneNote section-group folders.
     """
-    expand_exe = os.path.join(os.environ.get('WINDIR', r'C:\Windows'), 'System32', 'expand.exe')
-    if not os.path.exists(expand_exe):
-        raise RuntimeError(
-            'expand.exe not found. OneNote .onepkg unpacking currently requires '
-            'Windows. On Linux install cabextract/libmspack and adapt _expand_onepkg.'
-        )
-    subprocess.run([expand_exe, '-F:*', onepkg_path, out_dir], check=True, capture_output=True)
+    expand_exe = _find_expand_exe()
+    if expand_exe:
+        subprocess.run([expand_exe, '-F:*', onepkg_path, out_dir], check=True, capture_output=True)
+        return
+
+    cabextract = shutil.which('cabextract')
+    if cabextract:
+        subprocess.run([cabextract, '-q', '-d', out_dir, onepkg_path], check=True, capture_output=True)
+        return
+
+    raise RuntimeError(
+        '.onepkg unpacking needs either Windows expand.exe or the cabextract CLI '
+        '(neither found on PATH). Install cabextract — e.g. "apt install cabextract", '
+        '"brew install cabextract", "dnf install cabextract" — and retry.'
+    )
 
 
 def unpack_onepkg(onepkg_path: str, work_dir: str) -> list:

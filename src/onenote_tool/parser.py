@@ -239,9 +239,46 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
             list_runs[rid] = {'ordered': ordered, 'level': level}
 
     # Reconstruct visual order + which runs are the page title, from the tree.
-    order_index, title_run_ids = _page_content_order(props, by_id)
+    order_index, title_run_ids, run_page = _page_content_order(props, by_id)
     # Section page order (which page comes first), keyed by page object-space guid.
     page_order = _object_space_order(document, props, by_id)
+
+    # Per-page "consensus" formatting guid: the manifest tree (`run_page`) says
+    # which page a run structurally belongs to; `_run_guid` (TextRunFormatting)
+    # says which guid to actually GROUP it under. The two normally agree, but a
+    # real bug was found where a single run's own TextRunFormatting pointed at
+    # a stale, title-less object-space while every sibling run on the very same
+    # page (confirmed by the tree) correctly pointed at one shared guid —
+    # silently splitting one page into a titled remainder and a title-less
+    # orphan carrying just that one run (plus, via `current_guid` propagation,
+    # any images/tables/ink that followed it). Fix: for each tree-page, find
+    # the formatting guid its non-title body runs actually agree on (the
+    # "consensus"); a run whose own formatting guid disagrees with its page's
+    # consensus is corrected to the consensus instead — but ONLY when a
+    # consensus exists (a page with no body runs, e.g. one that's just a
+    # title, is left exactly as `_run_guid` would have grouped it, since
+    # there's nothing to compare against and second-guessing it regressed
+    # real pages on a real file: the tree walk has its own revision-store
+    # failure mode — a stale duplicate manifest can structurally claim content
+    # that legitimately belongs elsewhere — so it's trusted only as a
+    # tie-breaker among a page's own otherwise-agreeing siblings, never
+    # blindly over `_run_guid`).
+    _page_votes = {}
+    for prop in props:
+        if prop.get('type', '') not in _TEXT_TYPES:
+            continue
+        rid = _norm_identity(prop.get('identity'))
+        if rid in title_run_ids:
+            continue
+        tree_guid = run_page.get(rid)
+        fmt_guid = _run_guid(prop.get('val', {}))
+        if tree_guid and fmt_guid:
+            votes = _page_votes.setdefault(tree_guid, {})
+            votes[fmt_guid] = votes.get(fmt_guid, 0) + 1
+    page_consensus_guid = {
+        tree_guid: max(votes.items(), key=lambda kv: kv[1])[0]
+        for tree_guid, votes in _page_votes.items()
+    }
 
     groups = OrderedDict()  # guid -> {runs, images, files, date, time}
     image_counter = [0]
@@ -259,7 +296,15 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
         val = prop.get('val', {})
 
         if ptype in _TEXT_TYPES:
-            guid = _run_guid(val)
+            run_id = _norm_identity(prop.get('identity'))
+            formatting_guid = _run_guid(val)
+            consensus = page_consensus_guid.get(run_page.get(run_id))
+            # Trust `_run_guid` as-is unless this run is a proven outlier
+            # against its own page's sibling consensus (see above) — that
+            # keeps every already-correct page (the overwhelming majority)
+            # byte-for-byte unchanged, only correcting the specific runs that
+            # actually disagree with their real siblings.
+            guid = consensus if (consensus and formatting_guid != consensus) else (formatting_guid or consensus)
             if guid:
                 current_guid = guid
             if not current_guid:
@@ -289,10 +334,9 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
                 # a successful (if invisible) conversion, not a failure. Junk
                 # empty runs (not in the page's content tree) are dropped
                 # silently: nothing of substance to report either way.
-                blank_id = _norm_identity(prop.get('identity'))
-                if blank_id in order_index and blank_id not in grp['run_ids']:
-                    grp['run_ids'].add(blank_id)
-                    grp['runs'].append({'t': '', 'h': '', 'rid': blank_id, 'blank': True})
+                if run_id in order_index and run_id not in grp['run_ids']:
+                    grp['run_ids'].add(run_id)
+                    grp['runs'].append({'t': '', 'h': '', 'rid': run_id, 'blank': True})
                     report.ok('blank_paragraph')
                 continue
             if inline_html is None:
@@ -313,7 +357,6 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
             # identity (collapse them), but two different cells/paragraphs with
             # the same text have different identities and must both be kept
             # (otherwise duplicate table cells vanish).
-            run_id = _norm_identity(prop.get('identity'))
             if run_id is not None:
                 if run_id in grp['run_ids']:
                     continue

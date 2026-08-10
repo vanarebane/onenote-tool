@@ -11,10 +11,10 @@ about the parts *around and beyond* what that library gets right).
 A `.onepkg` export is a **CAB archive** (Microsoft Cabinet format)
 containing one `.one` file per section, with subfolders representing
 OneNote **section groups** (nested folders of sections). This tool unpacks
-it with Windows' own `expand.exe` (see
-[known-limitations.md](known-limitations.md) for why that's not portable
-yet) — a section's group path is just its relative directory inside the
-extracted CAB.
+it with Windows' own `expand.exe` when available, falling back to the
+`cabextract` CLI on Linux/macOS (see
+[known-limitations.md](known-limitations.md) for details) — a section's
+group path is just its relative directory inside the extracted CAB.
 
 The section's *display name* the user sees in OneNote is generally **not**
 recoverable from the `.one` file itself — pyOneNote can't extract it, and
@@ -151,6 +151,52 @@ takes, both confirmed against real files:
   different, unrelated live page — not just its own page's stale copy.
   This is the harder case, and not fully solved — see the same log for
   what was tried.
+
+This isn't only a password-protected-recovery problem — it reaches the
+**main, unprotected pipeline** too, via two more shapes confirmed against a
+real (unprotected) `.one` file:
+
+- **A run's own reference can target a stale sibling generation.** Page
+  grouping (`parser._run_guid`) keys off the object-space `ExtendedGUID`
+  embedded in a run's own `TextRunFormatting` property. Normally every run on
+  a page agrees on that guid — but one run (observed: the one carrying
+  highlight-colour formatting) can have a `TextRunFormatting` that instead
+  references a *different*, title-less object-space than every other run on
+  the same page (confirmed correct by the page's own manifest tree,
+  `ordering._page_content_order`). Grouping by `_run_guid` alone silently
+  split what the manifest tree agrees is one page into a titled remainder
+  plus a title-less orphan carrying just that one run (and, via
+  `current_guid` propagation, any images/tables/ink that immediately
+  followed it in file order) — reproducible on **three separately-exported
+  copies of the same notebook**, each splitting differently depending on
+  where the scrambled revision-store storage order happened to place things.
+  **Fixed**: `parser.parse_one_file` now computes, per page (as identified by
+  the manifest tree), the `_run_guid` value its non-title body runs actually
+  agree on (the "consensus"); a run whose own `_run_guid` disagrees with its
+  page's consensus is corrected to the consensus instead of trusted as-is.
+  Deliberately narrow — a page with no body runs to form a consensus from
+  (e.g. one that's just a title) is left exactly as `_run_guid` alone would
+  group it, because the manifest tree has its own failure mode too (below),
+  and blindly preferring it over an already-correct `_run_guid` regressed
+  real pages on a real file before this was narrowed down.
+- **The manifest tree itself is not immune.** A stale, superseded
+  `jcidPageManifestNode` generation can structurally claim (via its own
+  child-reference properties) content that legitimately belongs to the
+  current generation's manifest — i.e. the tree walk can be just as wrong as
+  `_run_guid`, in the opposite direction. This is why the fix above only
+  ever *corrects an outlier against its own siblings' consensus*, and never
+  blindly substitutes the tree's page-guid for `_run_guid`'s.
+- **Still open: which title snapshot is current.** Page titles have the same
+  duplication problem `page_title_by_guid` doesn't yet resolve: a renamed
+  page can leave both its old and new `CachedTitleString` snapshots in the
+  file under the exact same `(guid, revision)` identity tuple pyOneNote
+  exposes — no ordering signal currently available (revision counter,
+  timestamp) reliably distinguishes which is current. First-occurrence-wins
+  (today's behavior) is right on some real pages and stale on others in the
+  *same file* — there's no consistent direction to flip the tiebreak in
+  without a real signal to key it on. Left as a known gap rather than
+  guessed at; see
+  [known-limitations.md](known-limitations.md).
 
 ### Page/section ordering
 

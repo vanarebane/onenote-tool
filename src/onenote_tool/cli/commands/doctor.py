@@ -6,11 +6,13 @@ imported/patched successfully and reports key dependency versions.
 from __future__ import annotations
 
 import importlib.metadata
+import shutil
 import sys
 
 import typer
 
 import onenote_tool
+from onenote_tool.convert import _find_expand_exe
 
 
 def doctor() -> None:
@@ -27,6 +29,13 @@ def doctor() -> None:
         except importlib.metadata.PackageNotFoundError:
             typer.echo(f'{pkg}: (not installed)')
 
-    if sys.platform != 'win32':
-        typer.echo('\nNote: .onepkg unpacking currently requires Windows (expand.exe).')
+    expand_exe = _find_expand_exe()
+    cabextract = shutil.which('cabextract')
+    if expand_exe:
+        typer.echo(f'\n.onepkg unpacking: expand.exe found ({expand_exe}).')
+    elif cabextract:
+        typer.echo(f'\n.onepkg unpacking: cabextract found ({cabextract}).')
+    else:
+        typer.echo('\n.onepkg unpacking: NOT available — neither expand.exe nor cabextract on PATH.')
+        typer.echo('Install cabextract (apt/brew/dnf package "cabextract") or run on Windows.')
         typer.echo('See docs/knowledge/known-limitations.md.')

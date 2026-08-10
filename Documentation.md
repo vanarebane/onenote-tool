@@ -324,9 +324,9 @@ timeout/cancellation policy).
   installed or failed to import; check `PYONENOTE_IMPORT_ERROR` for why.
 - `RuntimeError('not a valid OneNote .one file')` — `parse_one_file` was
   given something that isn't a `.one` file at all.
-- `RuntimeError` from `unpack_onepkg`/CAB extraction — see
-  [known limitations](docs/knowledge/known-limitations.md) (Windows-only
-  today).
+- `RuntimeError` from `unpack_onepkg`/CAB extraction — needs `expand.exe`
+  (Windows) or `cabextract` (Linux/macOS) on `PATH`; see
+  [known limitations](docs/knowledge/known-limitations.md).
 - A single section failing to parse (a genuine bug, corrupt data, or a
   pyOneNote limitation like an unimplemented property type) does **not**
   abort the whole notebook — `process_sections` catches it, records

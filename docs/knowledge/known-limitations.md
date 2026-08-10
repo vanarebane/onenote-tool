@@ -4,16 +4,26 @@ A direct, unvarnished list — see [Documentation.md](../Documentation.md)'s
 progress tables for the content-type-by-content-type breakdown; this is the
 structural/architectural stuff underneath that.
 
-## Windows-only `.onepkg` unpacking
+## `.onepkg` unpacking needs an external CAB extractor
 
-`convert.unpack_onepkg` shells out to Windows' `expand.exe` to extract the
-`.onepkg` CAB archive. On any other platform it raises `RuntimeError`
-immediately, with a message pointing at `cabextract`/`libmspack` as the
-untried Linux/macOS path. Nobody has wired an alternative extractor in yet
-— `_expand_onepkg` in `convert.py` is the one function that would need a
-platform branch. (Parsing an already-extracted `.one` file, via
+`convert.unpack_onepkg` shells out to extract the `.onepkg` CAB archive —
+it doesn't parse the CAB format itself. `_expand_onepkg` in `convert.py`
+prefers Windows' built-in `expand.exe` when found (checked both at its
+usual `System32` path and on `PATH`, so this also covers Cygwin/WSL setups
+that expose it), and otherwise falls back to the `cabextract` CLI (wraps
+`libmspack`; install via `apt`/`brew`/`dnf` package `cabextract`), which
+covers Linux and macOS. If neither is present it raises `RuntimeError`
+with install guidance rather than silently failing. Run `onenote-tool
+doctor` to see which extractor (if any) it found.
+
+Both tools are shelled out to rather than reimplemented in Python because
+CAB extraction (LZX/MSZIP decompression) is nontrivial to get right, and
+both are mature, widely-packaged implementations. Nothing currently
+prevents also wiring in a pure-Python CAB reader if the external-binary
+dependency ever becomes a problem, but none has been vetted against real
+`.onepkg` files yet. (Parsing an already-extracted `.one` file, via
 `parse_one_file` directly, has no such restriction — it's pure Python +
-`pyOneNote`.)
+`pyOneNote`, no extractor needed.)
 
 ## Conversion is lossy by design
 
@@ -54,6 +64,32 @@ application also imports `pyOneNote` directly for something unrelated, it
 will observe these patches too. This is deliberate (it's the only way to
 fix real bugs/gaps in a third-party library without forking it), but worth
 knowing if you're debugging something that touches `pyOneNote` directly.
+
+## Revision-store duplication can misattribute content, even unprotected
+
+OneNote's revision-store duplication (see
+[onenote-file-format.md](onenote-file-format.md)) was previously documented
+as a password-protected-recovery-only concern. It isn't — verified on a real
+notebook, reproduced across **three separately-exported copies of the same
+section**, each corrupted differently:
+
+- **Fixed**: a run whose own `TextRunFormatting` reference pointed at a
+  stale, title-less object-space instead of the guid every other run on the
+  same page (confirmed by the page's own manifest tree) agreed on — this
+  silently split one page into a titled remainder plus a title-less orphan
+  page carrying that one run and whatever images/tables/ink immediately
+  followed it in file order. `parser.parse_one_file` now corrects a run
+  against its own page's sibling consensus when the two disagree (see
+  [onenote-file-format.md](onenote-file-format.md) for the exact mechanism
+  and why it's deliberately narrow).
+- **Still open**: a renamed page can leave both its old and new title text
+  in the file under the exact same identity tuple, with no reliable signal
+  to tell which is current — `page_title_by_guid`'s first-occurrence-wins
+  picks correctly on some pages and stalely on others in the *same* file.
+  Not attempted: a same-guid counter-example (a page whose title legitimately
+  needed the *first* occurrence, not the last) was found on the same test
+  file this was investigated against, ruling out a blind
+  first-wins-to-last-wins flip.
 
 ## Password-protected recovery has a real, not-yet-closed ceiling
 
