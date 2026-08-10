@@ -26,7 +26,13 @@ def _find_expand_exe() -> Optional[str]:
     candidate = os.path.join(os.environ.get('WINDIR', r'C:\Windows'), 'System32', 'expand.exe')
     if os.path.exists(candidate):
         return candidate
-    return shutil.which('expand.exe') or shutil.which('expand')
+    # Deliberately `expand.exe` only, never bare `expand` — GNU coreutils ships
+    # its OWN, completely unrelated `expand` (tabs -> spaces) at /usr/bin/expand
+    # on every Linux box, and `shutil.which('expand')` found and ran THAT one
+    # instead of failing over to cabextract (confirmed on a real deploy: it ran,
+    # rejected the CAB-extraction flags, and exited 1). Cygwin/WSL setups that
+    # expose Windows' PATH still resolve the real one via the `.exe` name.
+    return shutil.which('expand.exe')
 
 
 def _expand_onepkg(onepkg_path: str, out_dir: str) -> None:

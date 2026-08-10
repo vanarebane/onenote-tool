@@ -21,7 +21,7 @@ from .convert import convert_onepkg, process_sections, unpack_onepkg
 from .models import ConversionResult, ElementReport, PageFile, PageImage, PageResult, SectionResult
 from .parser import parse_one_file
 
-__version__ = '0.1.1'
+__version__ = '0.1.2'
 
 __all__ = [
     '__version__',
