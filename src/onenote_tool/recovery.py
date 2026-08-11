@@ -24,11 +24,11 @@ from ._patches import OneDocment, _pyonenote_filenode
 from .images import _FILE_PLACEHOLDER, _IMAGE_EXTS, _IMAGE_PLACEHOLDER, _MAX_IMAGE_DISPLAY_WIDTH, _attachment_kind
 from .models import PageFile, PageImage, PageResult
 from .rendering import (
-    _RTU_MARKER, _image_block_html, _media_block_html, _resolve_run_format, _rtu_to_inline_html,
-    _runs_to_paragraphs,
+    _RTU_MARKER, _child_ids, _image_block_html, _list_is_ordered, _media_block_html, _resolve_run_format,
+    _resolve_table_grid, _rtu_to_inline_html, _runs_to_paragraphs, _table_html,
 )
 from .stamps import classify_stamp
-from .text import _clean_text, _norm_identity, decode_run_text
+from .text import _clean_text, _le_int, _norm_identity, decode_run_text
 
 
 def _structural_page_groups(document) -> list:
@@ -49,8 +49,9 @@ def _structural_page_groups(document) -> list:
     that reads position/type/identity without touching content.
 
     Returns an ordered list of `{'title_identity', 'text_identities': [...],
-    'file_guids': [...], 'ink_identities': [...]}` — one per title
-    declaration that has ANY content after it before the next title (a
+    'file_guids': [...], 'ink_identities': [...], 'table_identities': [...]}`
+    — one per title declaration that has ANY content after it before the next
+    title (a
     title-only stub with nothing following is dropped — almost always a
     stale/superseded revision; OneNote's revision store keeps many of
     these).
@@ -93,7 +94,7 @@ def _structural_page_groups(document) -> list:
         jcid = getattr(body, 'jcid', None)
         if ref is not None and jcid is not None:
             jname = str(jcid)
-            if jname in ('jcidPageMetaData', 'jcidRichTextOENode'):
+            if jname in ('jcidPageMetaData', 'jcidRichTextOENode', 'jcidTableNode'):
                 decls.append((ref.stp, jname, str(body.oid)))
             elif getattr(jcid, 'jcid', None) == onenote_ink.JCID_INK_CONTAINER:
                 decls.append((ref.stp, 'Ink', str(body.oid)))
@@ -141,12 +142,16 @@ def _structural_page_groups(document) -> list:
         if kind == 'jcidPageMetaData':
             current = {
                 'title_identity': _norm_identity(identity), 'text_identities': [],
-                'file_guids': [], 'ink_identities': [],
+                'file_guids': [], 'ink_identities': [], 'table_identities': [],
             }
             groups.append(current)
             prev_text_stp = stp
             continue
-        if kind in ('jcidRichTextOENode', 'Ink'):
+        # Tables get the same gap-based clustering as text/ink (not FileData's
+        # always-attach-to-current): a table's own declaration is structurally
+        # page-local, same shape as a text run's, not the shared-store split
+        # FileData has (see the comment above on why FileData is different).
+        if kind in ('jcidRichTextOENode', 'Ink', 'jcidTableNode'):
             if prev_text_stp is not None and stp - prev_text_stp > _CLUSTER_GAP_THRESHOLD:
                 # No real title identity to key this synthetic group by — but
                 # it still needs a UNIQUE one (not None/falsy shared across
@@ -157,7 +162,7 @@ def _structural_page_groups(document) -> list:
                 orphan_counter += 1
                 current = {
                     'title_identity': f'__orphan_{orphan_counter}__', 'text_identities': [],
-                    'file_guids': [], 'ink_identities': [],
+                    'file_guids': [], 'ink_identities': [], 'table_identities': [],
                 }
                 groups.append(current)
             prev_text_stp = stp
@@ -171,10 +176,17 @@ def _structural_page_groups(document) -> list:
             norm = _norm_identity(identity)
             if norm:
                 current['ink_identities'].append(norm)
+        elif kind == 'jcidTableNode':
+            norm = _norm_identity(identity)
+            if norm:
+                current['table_identities'].append(norm)
         else:  # 'FileData' — identity is already a normalized get_files() guid key
             current['file_guids'].append(identity)
 
-    return [g for g in groups if g['text_identities'] or g['file_guids'] or g['ink_identities']]
+    return [
+        g for g in groups
+        if g['text_identities'] or g['file_guids'] or g['ink_identities'] or g['table_identities']
+    ]
 
 
 def _pages_from_structural_groups(document, by_id: dict, groups: list) -> list:
@@ -190,6 +202,34 @@ def _pages_from_structural_groups(document, by_id: dict, groups: list) -> list:
     except Exception:
         files = {}
 
+    # List membership, mirroring `parser.parse_one_file`'s own construction
+    # of this same mapping exactly, just walking `by_id` (deduped, shadow-
+    # decrypted properties) instead of the raw `props` list — a run's own
+    # PropertySet body has the SAME 3-attempt decode ceiling as everywhere
+    # else in this file, so this recovers list membership for however many
+    # OutlineElementNode/NumberListNode objects actually decoded, no more
+    # (unlike jcidTableNode — see `_structural_page_groups`'s table handling
+    # — this isn't a 0% ceiling on a real test file, just the usual partial
+    # one: verified ~47% of OutlineElementNode and ~25% of NumberListNode
+    # objects decoded non-empty on a real protected section).
+    list_runs = {}
+    for prop in by_id.values():
+        if prop.get('type', '') != 'jcidOutlineElementNode':
+            continue
+        val = prop.get('val', {})
+        refs = val.get('ListNodes')
+        if not refs:
+            continue
+        ordered = False
+        for lref in (refs if isinstance(refs, list) else [refs]):
+            ln = by_id.get(_norm_identity(lref))
+            if ln:
+                ordered = _list_is_ordered(ln.get('val', {}).get('NumberListFormat', ''))
+                break
+        level = max(0, _le_int(val.get('OutlineElementChildLevel'), 1) - 1)
+        for rid in _child_ids(prop):
+            list_runs[rid] = {'ordered': ordered, 'level': level}
+
     def _title_text(identity):
         t = (by_id.get(identity) or {}).get('val', {}).get('CachedTitleString')
         if isinstance(t, str) and t.strip():
@@ -199,10 +239,10 @@ def _pages_from_structural_groups(document, by_id: dict, groups: list) -> list:
     def _run_entry(identity):
         """Mirrors the normal per-page pipeline's TEXT_TYPES branch closely
         enough to reuse its renderer, `_runs_to_paragraphs` — same run-dict
-        shape ({'t','h','fmt'}), so formatting (bold/italic/color/highlight/
-        headings, resolved via `_resolve_run_format` against the same
-        shadow-decrypted `by_id`) renders instead of being silently dropped
-        as plain text."""
+        shape ({'t','h','fmt','list'}), so formatting (bold/italic/color/
+        highlight/headings, resolved via `_resolve_run_format` against the
+        same shadow-decrypted `by_id`) and list membership render instead of
+        being silently dropped as plain text."""
         val = (by_id.get(identity) or {}).get('val', {})
         raw = val.get('TextExtendedAscii')
         rtu = val.get('RichEditTextUnicode')
@@ -216,6 +256,8 @@ def _pages_from_structural_groups(document, by_id: dict, groups: list) -> list:
         if not text or classify_stamp(text)[0] is not None:
             return None
         entry = {'t': text, 'h': inline_html}
+        if identity in list_runs:
+            entry['list'] = list_runs[identity]
         fmt = _resolve_run_format(val.get('ParagraphStyle'), val.get('TextRunFormatting'), by_id)
         if fmt is not None:
             entry['fmt'] = fmt
@@ -240,7 +282,7 @@ def _pages_from_structural_groups(document, by_id: dict, groups: list) -> list:
     all_title_texts = set(real_titles.values())
 
     # PHASE 1: decode each group's raw content (title + run dicts + file
-    # guids), no rendering/claiming yet.
+    # guids + tables), no rendering/claiming yet.
     decoded = []
     for grp in groups:
         real_title = real_titles.get(grp['title_identity'])
@@ -250,9 +292,30 @@ def _pages_from_structural_groups(document, by_id: dict, groups: list) -> list:
             untitled_counter[0] += 1
             title = f'Untitled page {untitled_counter[0]}' if untitled_counter[0] > 1 else 'Untitled page'
 
+        # Tables first: `_resolve_table_grid` walks each table's own row/cell
+        # tree through the SAME shadow-decrypted `by_id` the normal per-page
+        # pipeline uses (its property values are ordinary plaintext once
+        # decrypted, same as any other object's — this needed no protected-
+        # specific handling at all, just wiring it in), and records which
+        # cell text-run identities it consumed so they're excluded below
+        # (same rule as the normal pipeline: cell text is shown in the
+        # table, not also as a loose body paragraph).
+        table_consumed = set()
+        table_ids = list(dict.fromkeys(grp['table_identities']))
+        grids = []
+        for tid in table_ids:
+            table_prop = by_id.get(tid)
+            if not table_prop:
+                continue
+            grid = _resolve_table_grid(table_prop, by_id, table_consumed)
+            if grid:
+                grids.append((tid, grid))
+
         seen_texts = set()
         runs = []
         for ident in grp['text_identities']:
+            if ident in table_consumed:
+                continue
             entry = _run_entry(ident)
             if entry and entry['t'] not in all_title_texts and entry['t'] not in seen_texts:
                 seen_texts.add(entry['t'])
@@ -262,7 +325,7 @@ def _pages_from_structural_groups(document, by_id: dict, groups: list) -> list:
         ink_identities = list(dict.fromkeys(grp['ink_identities']))
         decoded.append({
             'title_identity': grp['title_identity'], 'title': title, 'has_real_title': bool(real_title),
-            'runs': runs, 'file_guids': file_guids, 'ink_identities': ink_identities,
+            'runs': runs, 'file_guids': file_guids, 'ink_identities': ink_identities, 'tables': grids,
         })
 
     # PHASE 2: revision duplication produces more than one group for the SAME
@@ -289,17 +352,19 @@ def _pages_from_structural_groups(document, by_id: dict, groups: list) -> list:
     # richest first as a stable tiebreak) so untitled duplicates always lose to
     # a real page; untitled-vs-untitled duplicates still resolve by richness.
     def _richness(d):
-        return len(d['runs']) + len(d['file_guids']) + len(d['ink_identities'])
+        return len(d['runs']) + len(d['file_guids']) + len(d['ink_identities']) + len(d['tables'])
 
     claimed_texts = set()
     claimed_file_guids = set()
     claimed_ink = set()
+    claimed_tables = set()
     ordered = sorted(decoded, key=lambda d: (not d['has_real_title'], -_richness(d)))
     for d in ordered:
         if d['has_real_title']:
             claimed_texts.update(entry['t'] for entry in d['runs'])
             claimed_file_guids.update(d['file_guids'])
             claimed_ink.update(d['ink_identities'])
+            claimed_tables.update(tid for tid, _grid in d['tables'])
             continue
         kept_runs = []
         for entry in d['runs']:
@@ -316,6 +381,10 @@ def _pages_from_structural_groups(document, by_id: dict, groups: list) -> list:
         kept_ink = [i for i in d['ink_identities'] if i not in claimed_ink]
         claimed_ink.update(kept_ink)
         d['ink_identities'] = kept_ink
+
+        kept_tables = [(tid, grid) for tid, grid in d['tables'] if tid not in claimed_tables]
+        claimed_tables.update(tid for tid, _grid in kept_tables)
+        d['tables'] = kept_tables
 
     # PHASE 3: render surviving (non-empty, post-claim) groups, in original
     # structural order.
@@ -365,10 +434,12 @@ def _pages_from_structural_groups(document, by_id: dict, groups: list) -> list:
             if d['ink_identities'] else None
         )
 
-        if not d['runs'] and not images and not media and not attachments and not ink_svg:
+        if not d['runs'] and not images and not media and not attachments and not ink_svg and not d['tables']:
             continue
 
         blocks = []
+        for _tid, grid in d['tables']:
+            blocks.append({'kind': 'table', 'html': _table_html(grid)})
         if d['runs']:
             blocks.append({'kind': 'text', 'html': _runs_to_paragraphs(d['runs'])})
         for image in images:

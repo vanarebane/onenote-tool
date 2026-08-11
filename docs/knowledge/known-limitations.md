@@ -113,12 +113,35 @@ Even with a **verified correct** password:
 - Text formatting (bold/color/headings/etc.) only renders where the
   underlying style object happens to decode — not universal, no known way
   to force it currently.
-- Lists, tables, YouTube-embed matching, page indent levels, and the
-  floating-box canvas layout (`page.regions`) are not reconstructed at all
-  for protected content (see [Documentation.md](../Documentation.md)'s
-  progress table) — the recovery path that handles protected sections
-  doesn't implement these yet, even though the equivalent normal-section
-  code does.
+- **Lists**: implemented and verified — `recovery._pages_from_structural_groups`
+  now builds the same `jcidOutlineElementNode` → `ListNodes` → `NumberListFormat`
+  mapping the normal pipeline uses, reading it from `by_id` instead of the
+  raw `props` list. Real, partial recovery on the same test file: a page
+  that previously rendered as entirely flat paragraphs now has one real
+  `<ol>`/`<ul>` item. Bounded by the usual per-object decode ceiling, not by
+  missing wiring — on that file, ~47% of `jcidOutlineElementNode` and ~25%
+  of `jcidNumberListNode` objects decoded a non-empty property set; an item
+  whose own membership object didn't decode still renders as a plain
+  paragraph rather than being dropped.
+- **Tables**: wired in the same way (`_structural_page_groups` now also
+  clusters `jcidTableNode` declarations, reusing the normal pipeline's own
+  `rendering._resolve_table_grid`) but **confirmed non-functional on the
+  test file available**: every `jcidTableNode` property set — all 6, across
+  both protected sections tested — decoded completely empty (`val == {}`),
+  not partially like text/lists. This isn't a wiring gap; the object's own
+  body isn't recoverable via the existing 3-attempt decode chain on this
+  file, more severely than any other object type checked so far (plausibly
+  because a table's own properties lean more heavily on the same
+  unreliable OID-stream reference resolution than a plain text run's do —
+  unconfirmed, no smaller test case has isolated it). The code is left in
+  (degrades to silently contributing nothing, exactly like an unset list
+  item does) rather than reverted, since it's inert-safe and would start
+  working automatically if this decode ceiling is ever improved — but
+  don't expect real tables from protected content today.
+- YouTube-embed matching, page indent levels, and the floating-box canvas
+  layout (`page.regions`) are still not reconstructed at all for protected
+  content (see [Documentation.md](../Documentation.md)'s progress table) —
+  not yet attempted.
 - Exact page count on a **wrong** password is unrecoverable — page titles
   are encrypted too, and the revision-store duplication described in
   [onenote-file-format.md](onenote-file-format.md) makes it impossible to

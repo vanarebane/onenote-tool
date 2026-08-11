@@ -424,13 +424,13 @@ Legend: ✅ complete and verified · ⚠️ partial / best-effort · ❌ not imp
 | Bold / italic / underline / strikethrough | ✅ | ⚠️ (same — per-run, not guaranteed) |
 | Font color / highlight | ✅ | ⚠️ (same) |
 | Font size / family | ✅ (only where the run explicitly overrides the paragraph default — see below) | ⚠️ (same per-run decode ceiling as other formatting) |
-| Bulleted / numbered lists, incl. nesting | ✅ | ❌ (not reconstructed by protected-content recovery) |
+| Bulleted / numbered lists, incl. nesting | ✅ | ⚠️ (wired in; verified partial on a real file — ~47% of the objects needed for list membership and ~25% for ordered-vs-bullet decoded) |
 | Hyperlinks (standalone + inline) | ✅ | ⚠️ (mechanism is wired in, same per-run decode ceiling as formatting) |
 | Images (inline/pasted) | ✅ | ✅ |
 | Embedded files / attachments (non-image) | ✅ | ✅ |
 | Audio recordings | ✅ (inline `<audio>` player) | ✅ (same) |
 | Video attachments | ✅ (inline `<video>` player) | ✅ (same) |
-| Tables | ✅ (correct cell placement) | ❌ (not reconstructed by protected-content recovery) |
+| Tables | ✅ (correct cell placement) | ❌ (wired in, but every `jcidTableNode` in the test file decoded to a completely empty property set — 0/6 across both protected sections tested; see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) |
 | Ink / hand-drawn drawings | ✅ | ⚠️ (collected structurally; stroke decode has the same partial-decode ceiling) |
 | YouTube embeds (thumbnail-matched) | ✅ | ❌ |
 | Floating-box canvas layout (`page.regions`) | ✅ (position/size per top-level content box) | ❌ (not implemented for protected-content recovery) |

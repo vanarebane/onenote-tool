@@ -244,3 +244,45 @@ paying for the loop and short-circuiting to the same degenerate empty
 result the exception handler already produced
 (`_MAX_PLAUSIBLE_CPROPERTIES = 300`) — same end state, correctly fast
 instead of correctly slow.
+
+## Lists: wired in and confirmed partially working; tables: wired in, confirmed dead
+
+Both content types were missing from structural recovery not because
+they'd been tried and failed, but because nobody had tried — `parser.
+parse_one_file`'s normal per-page pipeline already builds list membership
+(`jcidOutlineElementNode` → `ListNodes` → `NumberListFormat`) and table
+grids (`rendering._resolve_table_grid`) from `by_id`, the SAME decrypted
+property map `_pages_from_structural_groups` already has. Wiring both in
+needed no new decode logic, no touching of page attribution/grouping (the
+part of this file that has actually regressed real files before — see the
+"sibling consensus" incident in [known-limitations.md](known-limitations.md))
+— just reading the same properties an already-working code path reads.
+
+**Lists: real, verified improvement.** On the same test file used
+throughout this doc, a page that previously rendered as entirely flat
+paragraphs (no `<ul>`/`<ol>` at all) now recovers at least one real list
+item. Partial, not complete — bounded by the standard per-object 3-attempt
+decode ceiling (`_ospropset_init`), same as titles/formatting/text runs
+always have been: on that file, `jcidOutlineElementNode` decoded non-empty
+~47% of the time (254/539) and `jcidNumberListNode` ~25% (3/12). An item
+whose own list-membership object didn't decode simply renders as a plain
+paragraph — never dropped, never crashes.
+
+**Tables: wired in, but confirmed non-functional on the only file
+available to test against.** Every single `jcidTableNode` property set
+found — 6 of 6, across both protected sections in the test notebook —
+decoded to a completely empty `val` (`{}`), not partially like every other
+object type checked. This is a MUCH harder failure than the usual partial
+ceiling and looks systematic rather than statistical, though the root
+cause isn't confirmed: a table's own properties (row/cell child
+references) may depend more heavily on the OID-stream reference
+resolution documented above as "still not reliable enough to lean on" than
+a plain scalar-heavy text run's properties do — plausible, not verified.
+**Left in the code anyway** (degrades to silently contributing nothing,
+same as an unset list item) rather than reverted: it's inert-safe on data
+that can't decode, and would start working the moment this specific
+ceiling is ever improved, without needing to be rediscovered. Don't expect
+real tables from a protected section today, though — if you're chasing
+this further, get a *different* real protected file with a table first and
+check whether `jcidTableNode.val` is *always* empty there too before
+assuming this generalizes.
