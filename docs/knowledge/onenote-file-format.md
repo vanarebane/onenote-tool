@@ -64,6 +64,28 @@ Key structural facts, all verified empirically against real files:
   nothing and all formatting is silently lost, even for a completely
   unprotected file.
 
+### Font size is half-points; the paragraph default is not the run override
+
+`FontSize` (on both `ParagraphStyle` and `TextRunFormatting` objects) is 2
+bytes, little-endian, in **half-points** — not documented anywhere found,
+confirmed empirically: a run labelled "X Large 36" carried the raw value
+`0x0048` = 72 half-points = 36pt; "X small 9" carried `0x0012` = 18 = 9pt.
+`Font` (the family name) is a plain NUL-terminated string on the same two
+object types.
+
+The two objects play different roles, same pattern as bold/italic/color
+elsewhere in this doc: `ParagraphStyle` always carries the paragraph's own
+default font size/family (present on essentially every run), while
+`TextRunFormatting` only carries a `FontSize`/`Font` at all when OneNote
+itself decided a specific run's font differs from that default — confirmed
+directly: a page demonstrating four sizes had `TextRunFormatting.FontSize`
+on the three non-default runs and *none at all* on the "Normal"-sized one,
+even though `ParagraphStyle.FontSize` was present on all four regardless.
+`rendering._resolve_run_format` reads font size/family from
+`TextRunFormatting` only, for exactly this reason — reading
+`ParagraphStyle`'s copy too would wrap every paragraph in a same-as-default
+span.
+
 ### Embedded files and images — two different node shapes
 
 An embedded file's actual bytes are reachable two different ways, and a
@@ -203,3 +225,27 @@ in *storage* order, not visual order — the real order has to be recovered
 by walking each page's manifest tree
 (`jcidPageManifestNode` → its ordered child-reference lists,
 `ordering._page_content_order`).
+
+### Floating boxes (canvas layout): reached via `jcidPageNode`, not the manifest
+
+A page's title (`jcidTitleNode`) and its independently-movable content boxes
+(`jcidOutlineNode`, one per floating box the user can drag anywhere on the
+canvas) are **siblings**, not nested inside each other — both hang directly
+off the page's own `jcidPageNode`, just via different reference keys: the
+title via `StructureElementChildNodes`, the outline boxes via
+`ElementChildNodesOfVersionHistory`. Getting there from a `jcidPageManifestNode`
+(the usual anchor for anything page-scoped in this codebase) takes one extra
+hop most other tree walks don't need: `PageManifestNode.
+ContentChildNodesOfPageManifest` → the page's own `jcidPageNode` → *its*
+`ElementChildNodesOfVersionHistory` → each `jcidOutlineNode`.
+
+Each `jcidOutlineNode` carries its own canvas position/size directly:
+`OffsetFromParentHoriz`/`OffsetFromParentVert` (top-left, relative to the
+page) and `LayoutMaxWidth`/`LayoutMaxHeight`. Unlike `FontSize` above, these
+arrive from pyOneNote as **plain ints already**, not packed little-endian
+bytes — verified directly against a real 3-box page (3 distinct `(x, y)`
+pairs matching its visual layout exactly); using `text._le_int` on them
+(the byte-packed-value reader) silently produced all-zero coordinates,
+caught before landing by cross-checking the parsed output against the
+manual property dump. `ordering._page_regions` has its own small `_int`
+coercion for this reason — see `models.PageRegion`.

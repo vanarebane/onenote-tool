@@ -21,9 +21,12 @@ from typing import Optional
 
 from . import ink as onenote_ink
 from ._patches import OneDocment, _pyonenote_filenode
-from .images import _FILE_PLACEHOLDER, _IMAGE_EXTS, _IMAGE_PLACEHOLDER, _MAX_IMAGE_DISPLAY_WIDTH
+from .images import _FILE_PLACEHOLDER, _IMAGE_EXTS, _IMAGE_PLACEHOLDER, _MAX_IMAGE_DISPLAY_WIDTH, _attachment_kind
 from .models import PageFile, PageImage, PageResult
-from .rendering import _RTU_MARKER, _image_block_html, _resolve_run_format, _rtu_to_inline_html, _runs_to_paragraphs
+from .rendering import (
+    _RTU_MARKER, _image_block_html, _media_block_html, _resolve_run_format, _rtu_to_inline_html,
+    _runs_to_paragraphs,
+)
 from .stamps import classify_stamp
 from .text import _clean_text, _norm_identity, decode_run_text
 
@@ -321,6 +324,7 @@ def _pages_from_structural_groups(document, by_id: dict, groups: list) -> list:
     results = []
     for d in decoded:
         images = []
+        media = []   # (kind, PageFile) for audio/video -> inline player block
         attachments = []
         for guid in d['file_guids']:
             fmeta = files.get(guid)
@@ -344,19 +348,24 @@ def _pages_from_structural_groups(document, by_id: dict, groups: list) -> list:
                     ref=f'{_IMAGE_PLACEHOLDER}{image_counter[0]}', data=content, ext=ext,
                     width=width, height=height, source_width=len(content),
                 ))
+                continue
+            file_counter[0] += 1
+            pf = PageFile(
+                ref=f'{_FILE_PLACEHOLDER}{file_counter[0]}', data=content,
+                filename=f'attachment{file_counter[0]}{ext or ""}',
+            )
+            kind = _attachment_kind(ext)
+            if kind == 'file':
+                attachments.append(pf)
             else:
-                file_counter[0] += 1
-                attachments.append(PageFile(
-                    ref=f'{_FILE_PLACEHOLDER}{file_counter[0]}', data=content,
-                    filename=f'attachment{file_counter[0]}{ext or ""}',
-                ))
+                media.append((kind, pf))
 
         ink_svg = (
             onenote_ink.render_ink_containers(by_id, d['ink_identities'], _norm_identity)
             if d['ink_identities'] else None
         )
 
-        if not d['runs'] and not images and not attachments and not ink_svg:
+        if not d['runs'] and not images and not media and not attachments and not ink_svg:
             continue
 
         blocks = []
@@ -367,6 +376,8 @@ def _pages_from_structural_groups(document, by_id: dict, groups: list) -> list:
                 'kind': 'image', 'html': _image_block_html(image.ref),
                 'image_src': image.ref, 'width': image.width, 'height': image.height,
             })
+        for kind, pf in media:
+            blocks.append({'kind': kind, 'html': _media_block_html(kind, pf.ref), f'{kind}_src': pf.ref})
         if attachments:
             import html as _html
             links = ''.join(
@@ -379,7 +390,7 @@ def _pages_from_structural_groups(document, by_id: dict, groups: list) -> list:
 
         results.append((d['title_identity'], PageResult(
             title=d['title'][:100], blocks=blocks, block_count=len(blocks),
-            images=images, files=attachments,
+            images=images, files=attachments + [pf for _k, pf in media],
         )))
 
     # A DIFFERENT revision-duplication shape: the exact SAME title identity

@@ -113,11 +113,12 @@ Even with a **verified correct** password:
 - Text formatting (bold/color/headings/etc.) only renders where the
   underlying style object happens to decode — not universal, no known way
   to force it currently.
-- Lists, tables, YouTube-embed matching, and page indent levels are not
-  reconstructed at all for protected content (see
-  [Documentation.md](../Documentation.md)'s progress table) — the recovery
-  path that handles protected sections doesn't implement these yet, even
-  though the equivalent normal-section code does.
+- Lists, tables, YouTube-embed matching, page indent levels, and the
+  floating-box canvas layout (`page.regions`) are not reconstructed at all
+  for protected content (see [Documentation.md](../Documentation.md)'s
+  progress table) — the recovery path that handles protected sections
+  doesn't implement these yet, even though the equivalent normal-section
+  code does.
 - Exact page count on a **wrong** password is unrecoverable — page titles
   are encrypted too, and the revision-store duplication described in
   [onenote-file-format.md](onenote-file-format.md) makes it impossible to
@@ -128,17 +129,24 @@ trail of what's been tried against each of these — several "obvious" fixes
 turned out to be real regressions on closer testing, so read that before
 attempting one of the above.
 
-## No canvas/layout position is exposed
+## Canvas/layout position: exposed via `page.regions`, normal sections only
 
-OneNote pages are a free-form canvas — content boxes can be placed
-anywhere. This library deliberately does not expose that positioning at
-all (see [Documentation.md](../Documentation.md)'s "blocks format" section)
-— `PageResult.blocks` is content only, in reading order. If your
-application wants to reproduce OneNote's own canvas layout, this library
-currently gives you nothing to do that with; you'd need to add that
-yourself, reading the underlying `LayoutMax*`/`OffsetFromParent*`
-properties this package's `parser.py` already sees but doesn't currently
-surface.
+`PageResult.blocks` itself is still content-only, in reading order, with no
+`x`/`y` on an individual block — that's deliberate (see
+[Documentation.md](../Documentation.md)'s "blocks format" section). A
+free-form floating-box view IS available additively via `page.regions`
+(`models.PageRegion`, one per top-level `OutlineNode`, position from
+`OffsetFromParentHoriz/Vert` + size from `LayoutMaxWidth/Height` —
+`ordering._page_regions`), verified against a real file with 3 independent
+boxes on one page (3 distinct `(x, y)` pairs matching its visual layout).
+
+Not implemented for password-protected-section recovery — `regions` is
+always `[]` there; that recovery path has no notion of "which outline box"
+at all, only a flatter title/text/file clustering (see
+`recovery._structural_page_groups`), and building one would need real
+verification against a protected file with multiple floating boxes, which
+hasn't been done. `blocks` remains authoritative for content either way;
+`regions` is a purely additive, best-effort second view.
 
 ## YouTube thumbnail matching needs network access
 
@@ -151,6 +159,25 @@ to a specific image, and would load its thumbnail from YouTube client-side
 instead) if there's no network access or the request fails. There is
 currently no way to disable this call explicitly if you want to guarantee
 zero network access — it fails closed on its own, but doesn't fail fast.
+
+## Recycle-bin / deleted-page content: unconfirmed lead, not acted on
+
+OneNote has a per-notebook recycle bin (deleted pages/sections are held, not
+immediately purged). `pyOneNote`'s own property-name table has an
+`IsDeletedGraphSpaceContent` entry (jcid `0x1C001DE9`) — architecturally
+almost certainly the flag for this — but it was checked directly against
+every section of the test notebook this project uses (including one with a
+page deliberately deleted first) and never appeared on a single property,
+in any section. Either a plain `.onepkg` export doesn't carry recycle-bin
+content at all (most likely — would mean there's nothing here to handle),
+or it's exposed in a shape `get_json()`'s property decode doesn't surface
+(e.g. structural FileNode metadata rather than a `PropertySet` property).
+**Not implemented, not guessed at** — no verified file exists yet where this
+flag is actually set, and the earlier "sibling consensus" incident above is
+a direct example of what shipping a plausible-but-unverified fix here would
+risk. If a real file surfaces where deleted content is visibly leaking into
+a normal parse (spurious pages/titles that don't correspond to anything the
+user still has), that's the first thing to check for.
 
 ## Testing has real gaps
 

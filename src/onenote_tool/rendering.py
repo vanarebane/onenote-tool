@@ -33,6 +33,13 @@ def _image_block_html(ref: str) -> str:
     return f'<img src="{src}" alt="">'
 
 
+def _media_block_html(tag: str, ref: str) -> str:
+    """The `html` fragment for an 'audio'/'video' block — an HTML5 player
+    with `ref` as `src` (same placeholder-token contract as `_image_block_html`)."""
+    src = html.escape(ref, quote=True)
+    return f'<{tag} controls src="{src}"></{tag}>'
+
+
 _RTU_MARKER = '﷟'  # noqa (U+FDDF hyperlink field marker in RichEditTextUnicode)
 
 # Bare URLs written as plain text (no HYPERLINK field) are auto-linked too.
@@ -69,6 +76,20 @@ def _heading_level(style_id) -> Optional[int]:
     return None
 
 
+def _font_size_pt(value) -> Optional[float]:
+    """OneNote's FontSize prop is 2 bytes, little-endian, in HALF-POINTS
+    (verified against a real file: a run labelled "X Large 36" carried the
+    raw bytes for 72 half-points = 36pt, "X small 9" carried 18 = 9pt)."""
+    b = _as_bytes(value)
+    if len(b) < 2:
+        return None
+    half_points = int.from_bytes(b[:2], 'little')
+    if not half_points:
+        return None
+    pt = half_points / 2
+    return int(pt) if pt == int(pt) else pt
+
+
 def _style_flags(obj) -> dict:
     """Char-style fields off a jcidParagraphStyleObjectForText object."""
     v = obj.get('val', {})
@@ -89,7 +110,8 @@ def _resolve_run_format(ps_ref, trf_ref, by_id) -> Optional[dict]:
     user applied). Overrides win. TextRunFormatting is a list of run-index
     spans; we apply the first (covers uniformly-styled runs)."""
     fmt = {'bold': False, 'italic': False, 'underline': False, 'strike': False,
-           'color': None, 'highlight': None, 'heading': None}
+           'color': None, 'highlight': None, 'heading': None,
+           'font_size': None, 'font_family': None}
 
     ps = by_id.get(_norm_identity(ps_ref[0] if isinstance(ps_ref, list) else ps_ref))
     if ps:
@@ -110,6 +132,22 @@ def _resolve_run_format(ps_ref, trf_ref, by_id) -> Optional[dict]:
             fmt['color'] = over['color']
         if over['highlight']:
             fmt['highlight'] = over['highlight']
+        # Deliberately read font size/family from TextRunFormatting ONLY,
+        # never from ParagraphStyle: OneNote itself only ever writes a
+        # FontSize/Font onto TextRunFormatting when the run's font actually
+        # differs from the paragraph's own default (verified: a page
+        # demonstrating four sizes had a TextRunFormatting.FontSize on the
+        # three non-default runs and none at all on the "Normal"-sized one,
+        # even though ParagraphStyle.FontSize is always present on every
+        # run regardless). Reading ParagraphStyle here too would wrap every
+        # single paragraph in a same-as-default font-size/family span.
+        trf_val = trf.get('val', {})
+        size = _font_size_pt(trf_val.get('FontSize'))
+        if size:
+            fmt['font_size'] = size
+        family = str(trf_val.get('Font') or '').replace('\x00', '').strip()
+        if family:
+            fmt['font_family'] = family
 
     return fmt if any(fmt.values()) else None
 
@@ -130,6 +168,13 @@ def _apply_marks(inner: str, fmt: Optional[dict]) -> str:
         inner = f'<span style="color:{fmt["color"]}">{inner}</span>'
     if fmt.get('highlight'):
         inner = f'<span style="background-color:{fmt["highlight"]}">{inner}</span>'
+    if fmt.get('font_size') or fmt.get('font_family'):
+        styles = []
+        if fmt.get('font_size'):
+            styles.append(f'font-size:{fmt["font_size"]}pt')
+        if fmt.get('font_family'):
+            styles.append(f'font-family:{html.escape(fmt["font_family"], quote=True)}')
+        inner = f'<span style="{";".join(styles)}">{inner}</span>'
     return inner
 
 

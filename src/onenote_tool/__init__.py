@@ -18,10 +18,10 @@ from __future__ import annotations
 
 from ._patches import PYONENOTE_AVAILABLE, PYONENOTE_IMPORT_ERROR, PyOneNoteUnavailable
 from .convert import convert_onepkg, process_sections, unpack_onepkg
-from .models import ConversionResult, ElementReport, PageFile, PageImage, PageResult, SectionResult
+from .models import ConversionResult, ElementReport, PageFile, PageImage, PageRegion, PageResult, SectionResult
 from .parser import parse_one_file
 
-__version__ = '0.1.2'
+__version__ = '0.1.3'
 
 __all__ = [
     '__version__',
@@ -36,6 +36,7 @@ __all__ = [
     'ElementReport',
     'PageFile',
     'PageImage',
+    'PageRegion',
     'PageResult',
     'SectionResult',
 ]

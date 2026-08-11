@@ -17,8 +17,27 @@ _YOUTUBE_ID_RE = re.compile(
 
 _IMAGE_TYPES = {'jcidImageNode'}
 _IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'}
+# Audio recordings (e.g. OneNote's own "Record Audio") and video files arrive
+# as an ordinary embedded-file attachment (`_build_embedded_file`) — there's
+# no dedicated jcid for either, just a filename extension to go on, same as
+# any other attachment type this package doesn't have a specific node shape
+# for.
+_AUDIO_EXTS = {'.mp3', '.wav', '.m4a', '.aac', '.ogg', '.oga', '.opus', '.wma', '.flac'}
+_VIDEO_EXTS = {'.mp4', '.webm', '.mov', '.avi', '.wmv', '.mkv', '.m4v'}
 _IMAGE_PLACEHOLDER = 'onenote-image://'  # caller replaces with the uploaded URL
 _FILE_PLACEHOLDER = 'onenote-file://'    # caller replaces with the uploaded URL (non-image attachments)
+
+
+def _attachment_kind(ext: str) -> str:
+    """Classify a non-image attachment's extension for block rendering:
+    'audio'/'video' get an inline HTML5 player block, anything else falls
+    back to a plain download link (`'file'`)."""
+    ext = (ext or '').lower()
+    if ext in _AUDIO_EXTS:
+        return 'audio'
+    if ext in _VIDEO_EXTS:
+        return 'video'
+    return 'file'
 
 # A displayed image's reported width is capped at this many pixels (OneNote's
 # own LayoutMax*/Picture* properties can report arbitrarily large values);

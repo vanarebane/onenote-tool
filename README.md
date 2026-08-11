@@ -13,9 +13,11 @@ exactly what's currently supported.
 
 ## What it's for
 
-- Pulling text, images, tables, hyperlinks, ink/drawings, and embedded
-  files out of a `.onepkg` export into a neutral, semantic HTML-per-block
-  format your own code can render however it likes.
+- Pulling text, images, audio/video, tables, hyperlinks, ink/drawings, and
+  embedded files out of a `.onepkg` export into a neutral, semantic
+  HTML-per-block format your own code can render however it likes — with an
+  optional, additive floating-box layout view (`page.regions`) for an
+  application that wants to reproduce OneNote's own free-form canvas.
 - Recovering as much as possible from a **password-protected** section,
   given the password — OneNote's own export/print tools generally refuse
   to touch protected content at all.

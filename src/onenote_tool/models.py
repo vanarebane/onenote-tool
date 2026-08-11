@@ -45,20 +45,46 @@ class PageFile:
 
 
 @dataclass
+class PageRegion:
+    """One of a page's independently-movable "floating boxes" on OneNote's
+    free-form canvas (a top-level `jcidOutlineNode`), with its own position/
+    size and the subset of the page's content structurally inside it. `x`/
+    `y`/`width`/`height` are OneNote's own canvas units (not necessarily
+    pixels 1:1) relative to the page's top-left. `blocks` uses the exact
+    same per-block shape as `PageResult.blocks` — position lives only on the
+    `PageRegion` container, never on an individual block."""
+    x: int
+    y: int
+    width: int
+    height: int
+    blocks: list = field(default_factory=list)
+
+
+@dataclass
 class PageResult:
     title: str
     block_count: int
     # Neutral content blocks, in reading order — see Documentation.md's
     # "blocks format" section for the full contract. Each dict has at least
-    # {'kind': 'text'|'image'|'table'|'ink'|'file_links', 'html': str}; an
-    # 'image' block additionally carries 'image_src'/'width'/'height'.
+    # {'kind': 'text'|'image'|'audio'|'video'|'table'|'ink'|'file_links', 'html': str};
+    # an 'image'/'audio'/'video' block additionally carries 'image_src'/
+    # 'audio_src'/'video_src' (+ 'width'/'height' for 'image').
     # Deliberately has NO position/layout information (no x/y/width-as-
-    # pixels) — that's presentation, left to the caller.
+    # pixels) — that's presentation, left to the caller. See `regions` below
+    # for the opt-in, position-aware alternative view of the same content.
     blocks: list = field(default_factory=list)
     created_at: Optional[datetime] = None  # parsed from the page's date stamp
     images: list = field(default_factory=list)  # list[PageImage] to upload
     files: list = field(default_factory=list)  # list[PageFile] to upload (non-image attachments)
     sub_level: int = 0  # OneNote PageLevel-1 (0 = top level, 1 = sub-page, ...)
+    # OneNote's own floating-box layout, one PageRegion per top-level content
+    # box, in no particular guaranteed order (canvas boxes have no inherent
+    # reading order — use `blocks` for that). Empty when this page's layout
+    # couldn't be resolved (e.g. protected-content recovery, which doesn't
+    # implement this) — always check `blocks` for content; `regions` is a
+    # purely additive, best-effort second view of the SAME content, not a
+    # replacement.
+    regions: list = field(default_factory=list)  # list[PageRegion]
 
 
 @dataclass

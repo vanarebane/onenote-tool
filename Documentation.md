@@ -81,7 +81,7 @@ first when something doesn't work.
 ```python
 from onenote_tool import (
     convert_onepkg, unpack_onepkg, process_sections, parse_one_file,
-    ConversionResult, SectionResult, PageResult, PageImage, PageFile, ElementReport,
+    ConversionResult, SectionResult, PageResult, PageImage, PageFile, PageRegion, ElementReport,
     PYONENOTE_AVAILABLE, PYONENOTE_IMPORT_ERROR, PyOneNoteUnavailable,
 )
 ```
@@ -147,8 +147,9 @@ class PageResult:
     blocks: list           # see "The blocks format" below
     created_at: datetime | None    # from the page's own date/time stamp, if any
     images: list            # list[PageImage] — the raw bytes behind any 'image' block
-    files: list              # list[PageFile] — the raw bytes behind any 'file_links' block
+    files: list              # list[PageFile] — the raw bytes behind any 'file_links'/'audio'/'video' block
     sub_level: int = 0        # OneNote page indent: 0 = top level, 1 = sub-page, ...
+    regions: list = []        # list[PageRegion] — see "PageResult.regions" below
 
 @dataclass
 class PageImage:
@@ -166,6 +167,14 @@ class PageFile:
     ref: str
     data: bytes
     filename: str
+
+@dataclass
+class PageRegion:
+    x: int
+    y: int
+    width: int
+    height: int
+    blocks: list       # same shape as PageResult.blocks
 
 @dataclass
 class SectionResult:
@@ -212,36 +221,72 @@ self-contained, semantic HTML fragment:
 
 ```python
 {
-    "kind": "text" | "image" | "table" | "ink" | "file_links",
+    "kind": "text" | "image" | "audio" | "video" | "table" | "ink" | "file_links",
     "html": "<p>...</p>",   # always present — a ready-to-embed fragment
     # "image" kind only:
     "image_src": "onenote-image://3",   # matches some PageImage.ref in page.images
     "width": 512,
     "height": 384,
+    # "audio" / "video" kind only:
+    "audio_src": "onenote-file://5",    # matches some PageFile.ref in page.files
+    "video_src": "onenote-file://6",    # (same idea, "video" kind)
 }
 ```
 
 This is deliberately **not** a layout format — there is no `x`/`y`/pixel
-position anywhere. OneNote's own pages are free-form canvases (users drag
-text/image boxes anywhere), but this library doesn't try to reproduce that
-canvas: it hands you the content, in the order OneNote itself stores it,
-and leaves layout entirely to you. If your application wants OneNote's
-original floating-box positions, canvas coordinates aren't currently
-exposed by this library at all — see
-[known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md).
+position anywhere on an individual block. OneNote's own pages are free-form
+canvases (users drag text/image boxes anywhere), but `blocks` doesn't try to
+reproduce that canvas: it hands you the content, in the order OneNote itself
+stores it, and leaves layout entirely to you. See `page.regions` below if
+your application wants the canvas positions themselves.
 
-An image or file block's `html` (`<img src="...">` for images; a list of
-`<p>📎 <a href="...">name</a></p>` links for `file_links`) references its
-placeholder token (`PageImage.ref` / `PageFile.ref`, e.g.
+An image/audio/video/file block's `html` (`<img src="...">` for images,
+`<audio controls src="...">`/`<video controls src="...">` for audio/video, a
+list of `<p>📎 <a href="...">name</a></p>` links for `file_links`)
+references its placeholder token (`PageImage.ref` / `PageFile.ref`, e.g.
 `"onenote-image://3"`) as the `src`/`href` — **your code is responsible for
 uploading `PageImage.data`/`PageFile.data` somewhere and substituting the
 real URL in place of that token** (a simple string replace across the
-block's `html` is enough; the token is unique per page).
+block's `html` is enough; the token is unique per page). Audio/video
+attachments are ordinary `PageFile`s in `page.files` — there's no dedicated
+jcid for either in OneNote's format, so they're recognized by filename
+extension the same way any other attachment type without its own node shape
+would be.
 
 An `'ink'` block's `html` is a self-contained inline `<svg>...</svg>`
 fragment (see
 [docs/knowledge/onenote-file-format.md](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/onenote-file-format.md)
 for how ink strokes are decoded) — there's nothing else to extract from it.
+
+### `PageResult.regions` — OneNote's floating-box layout
+
+`page.regions` is an opt-in, **additive** second view of the exact same
+content, for a caller that wants to reproduce OneNote's own free-form canvas
+(where the user can drag independent text/image boxes anywhere on the page)
+instead of a single top-to-bottom flow:
+
+```python
+@dataclass
+class PageRegion:
+    x: int
+    y: int
+    width: int
+    height: int
+    blocks: list   # same per-block shape as PageResult.blocks — position lives ONLY on PageRegion
+```
+
+Each `PageRegion` is one of the page's own top-level, independently-movable
+content boxes (a OneNote `OutlineNode`), with its own `x`/`y`/`width`/
+`height` (OneNote's own canvas units, not necessarily 1:1 with CSS pixels)
+relative to the page's top-left corner. `regions` has **no guaranteed
+order** — canvas boxes have no inherent reading order; use `blocks` for
+that. A page with just one content box still gets one region.
+
+`regions` is empty when this page's box layout couldn't be resolved — most
+notably, **password-protected-section recovery doesn't implement this at
+all** (see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md))
+— so always use `blocks` for content and treat `regions` as best-effort
+positioning on top of it, never the other way around.
 
 ## Password handling
 
@@ -378,20 +423,31 @@ Legend: ✅ complete and verified · ⚠️ partial / best-effort · ❌ not imp
 | Headings (h1–h3) | ✅ | ⚠️ (only when the underlying style object decodes) |
 | Bold / italic / underline / strikethrough | ✅ | ⚠️ (same — per-run, not guaranteed) |
 | Font color / highlight | ✅ | ⚠️ (same) |
-| Font size / family | ❌ (not mapped to output) | ❌ |
+| Font size / family | ✅ (only where the run explicitly overrides the paragraph default — see below) | ⚠️ (same per-run decode ceiling as other formatting) |
 | Bulleted / numbered lists, incl. nesting | ✅ | ❌ (not reconstructed by protected-content recovery) |
 | Hyperlinks (standalone + inline) | ✅ | ⚠️ (mechanism is wired in, same per-run decode ceiling as formatting) |
 | Images (inline/pasted) | ✅ | ✅ |
 | Embedded files / attachments (non-image) | ✅ | ✅ |
+| Audio recordings | ✅ (inline `<audio>` player) | ✅ (same) |
+| Video attachments | ✅ (inline `<video>` player) | ✅ (same) |
 | Tables | ✅ (correct cell placement) | ❌ (not reconstructed by protected-content recovery) |
 | Ink / hand-drawn drawings | ✅ | ⚠️ (collected structurally; stroke decode has the same partial-decode ceiling) |
 | YouTube embeds (thumbnail-matched) | ✅ | ❌ |
+| Floating-box canvas layout (`page.regions`) | ✅ (position/size per top-level content box) | ❌ (not implemented for protected-content recovery) |
 | Page titles | ✅ | ⚠️ (commonly ~50–100% depending on the file; some titles are never recoverable at all) |
 | Page order within a section | ✅ | ⚠️ (structural file-position order used as a proxy, not verified against OneNote's own page-series order) |
 | Section groups / folders | ✅ | ✅ (comes from the `.onepkg` archive structure, unaffected by a section's own encryption) |
 | Date/time auto-stamps → page `created_at` | ✅ | ✅ |
 | Page indent level (sub-pages) | ✅ | ❌ (protected-content recovery doesn't set this; always 0) |
 | Revision-duplicate cleanup (no ghost/duplicate pages) | ✅ | ⚠️ (actively handled with a dedicated dedup pass; some spillover cases are documented, not all eliminated) |
+
+Font size/family is deliberately **not** mapped from `ParagraphStyle` (the
+paragraph's own default, present on essentially every run) — only from a run's
+own `TextRunFormatting` override, matching what OneNote itself actually writes
+(it only ever sets a run-level `FontSize`/`Font` when that run's font differs
+from the paragraph's default). Mapping the always-present paragraph default
+too would wrap every single paragraph in a same-as-default `font-size`/
+`font-family` span for no visible difference.
 
 ### Table B — OneNote versions tested against
 

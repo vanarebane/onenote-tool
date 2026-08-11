@@ -11,6 +11,20 @@ from .text import _norm_identity
 _TITLE_TYPES = {'jcidTitleNode'}
 _TABLE_TYPES = {'jcidTableNode'}
 _TABLE_PART_TYPES = {'jcidTableRowNode', 'jcidTableCellNode'}
+_IMAGE_TYPES = {'jcidImageNode'}
+_EMBED_TYPES = {'jcidEmbeddedFileNode'}
+_INK_CONTAINER_JCID = 0x00060014  # onenote_ink.JCID_INK_CONTAINER, duplicated to dodge the same import cycle
+
+
+def _int(value, default: int = 0) -> int:
+    """`OffsetFromParentHoriz`/`LayoutMaxWidth`/etc. come back from pyOneNote
+    as plain ints already (unlike e.g. `FontSize`, packed as little-endian
+    bytes — see `rendering._font_size_pt` — `_le_int` is for that shape, not
+    this one)."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 # Ordered child-reference lists, walked to reconstruct the SECTION's page order
 # (_object_space_order) — deliberately a wider key set than _CONTENT_CHILD_KEYS
@@ -148,3 +162,82 @@ def _page_content_order(props, by_id):
         if p.get('type', '') == 'jcidPageManifestNode':
             walk(_norm_identity(p.get('identity')), False)
     return order, title_ids
+
+
+def _page_regions(props, by_id):
+    """Group each page's own top-level `jcidOutlineNode` children — OneNote's
+    independently-movable "floating boxes" on the page canvas — with their
+    `OffsetFromParentHoriz/Vert` position and `LayoutMaxWidth/Height` size
+    (verified against a real file: a page with 3 boxes reported 3 distinct
+    (x, y) pairs matching its visual layout), and map every run/image/table/
+    ink container structurally underneath one back to it.
+
+    A page's title is never inside one of these — it hangs off the page node
+    directly (`StructureElementChildNodes`), not through an outline — so,
+    unlike `_page_content_order`, there's no title/body distinction to track
+    here.
+
+    Returns `(regions_by_page{page_guid: [{'guid','x','y','width','height'}, ...]}`
+    in page order, `content_region{content_identity: region_guid})`. A page
+    whose structure doesn't resolve this way (e.g. a still-encrypted
+    protected section, where these child-reference properties don't decode
+    at all) simply contributes no entries — same "additive, silently absent
+    when it can't be built" shape as the rest of this module.
+    """
+    regions_by_page = {}
+    content_region = {}
+    seen = set()
+
+    def walk(nid, region_guid):
+        if not nid or nid in seen:
+            return
+        seen.add(nid)
+        p = by_id.get(nid)
+        if not p:
+            return
+        t = p.get('type', '')
+        if t in _TABLE_TYPES or t in _TABLE_PART_TYPES:
+            if t in _TABLE_TYPES and region_guid:
+                content_region[nid] = region_guid
+            return  # tables + their cell runs are handled/consumed separately
+        if t == 'jcidRichTextOENode':
+            if region_guid:
+                content_region[nid] = region_guid
+            return
+        if region_guid and (t in _IMAGE_TYPES or t in _EMBED_TYPES or p.get('jcid_raw') == _INK_CONTAINER_JCID):
+            content_region[nid] = region_guid
+        for child in _content_child_ids(p):
+            walk(child, region_guid)
+
+    for p in props:
+        if p.get('type', '') != 'jcidPageManifestNode':
+            continue
+        page_guid = (_norm_identity(p.get('identity')) or '').split(',')[0] or None
+        # First-occurrence-wins per page, same as everywhere else in this
+        # package — a stale duplicate PageManifestNode (see
+        # onenote-file-format.md's revision-duplication section) shouldn't
+        # get its own, likely-bogus, second region list for the same page.
+        if not page_guid or page_guid in regions_by_page:
+            continue
+        for pnid in _content_child_ids(p):
+            page_node = by_id.get(pnid)
+            if not page_node or page_node.get('type') != 'jcidPageNode':
+                continue
+            region_list = regions_by_page.setdefault(page_guid, [])
+            for onid in _content_child_ids(page_node):
+                onode = by_id.get(onid)
+                if not onode or onode.get('type') != 'jcidOutlineNode':
+                    continue
+                ov = onode.get('val', {})
+                region_guid = (onid or '').split(',')[0]
+                if not region_guid:
+                    continue
+                region_list.append({
+                    'guid': region_guid,
+                    'x': _int(ov.get('OffsetFromParentHoriz')),
+                    'y': _int(ov.get('OffsetFromParentVert')),
+                    'width': _int(ov.get('LayoutMaxWidth')),
+                    'height': _int(ov.get('LayoutMaxHeight')),
+                })
+                walk(onid, region_guid)
+    return regions_by_page, content_region

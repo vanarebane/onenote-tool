@@ -16,3 +16,4 @@ tests/fixtures/*
 *.onepkg
 *.one
 *.onex
+_unpacked/Open Notebook.onetoc2

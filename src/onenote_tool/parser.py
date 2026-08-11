@@ -20,15 +20,16 @@ from . import ink as onenote_ink
 from ._patches import OneDocment, _active_decrypt, _active_shadow, check_valid, require_pyonenote
 from .images import (
     _DHASH_THUMB_MATCH, _FILE_PLACEHOLDER, _IMAGE_EXTS, _IMAGE_PLACEHOLDER, _IMAGE_TYPES,
-    _build_embedded_file, _build_page_image, _dham, _same_image, _youtube_from_rtu, _youtube_thumb_hashes,
+    _attachment_kind, _build_embedded_file, _build_page_image, _dham, _same_image, _youtube_from_rtu,
+    _youtube_thumb_hashes,
 )
-from .models import ElementReport, PageResult
-from .ordering import _object_space_order, _page_content_order
+from .models import ElementReport, PageRegion, PageResult
+from .ordering import _object_space_order, _page_content_order, _page_regions
 from .recovery import _flat_recover_protected_pages
 from .rendering import (
-    _RTU_MARKER, _child_ids, _has_visible_content, _image_block_html, _list_is_ordered, _placeholder_blocks,
-    _placeholder_run, _placeholder_text, _resolve_run_format, _resolve_table_grid, _runs_to_paragraphs,
-    _rtu_to_inline_html, _table_html,
+    _RTU_MARKER, _child_ids, _has_visible_content, _image_block_html, _list_is_ordered, _media_block_html,
+    _placeholder_blocks, _placeholder_run, _placeholder_text, _resolve_run_format, _resolve_table_grid,
+    _runs_to_paragraphs, _rtu_to_inline_html, _table_html,
 )
 from .stamps import _is_stamp, classify_stamp
 from .text import _clean_text, _clean_title, _extract_guid, _le_int, _norm_identity, decode_run_text
@@ -84,6 +85,77 @@ def _run_guid(val) -> Optional[str]:
     """The object-space ExtendedGUID (page id) referenced by a run's formatting."""
     m = _GUID_RE.search(str(val.get('TextRunFormatting', '')))
     return m.group(1) if m else None
+
+
+def _build_blocks(runs, tables, images, ink_container_ids, files, by_id, used_thumb_refs, report=None) -> list:
+    """Render one content scope (a whole page, or a single `PageRegion`) into
+    `blocks` — the same builder both call, so a region's content is rendered
+    identically to how it would look in the flat, whole-page `blocks` list.
+
+    `report` is optional and, when given, only ever used for the ink
+    drawing's own converted/failed tally — passed for the whole-page call and
+    omitted for each of that same page's region calls, so re-rendering the
+    SAME ink drawing into a region's own blocks doesn't double-count it.
+    """
+    blocks = []
+
+    for _tid, grid in tables:
+        blocks.append({'kind': 'table', 'html': _table_html(grid)})
+
+    if runs:
+        blocks.append({'kind': 'text', 'html': _runs_to_paragraphs(runs)})
+
+    for image in images:
+        if image.ref in used_thumb_refs:
+            continue  # shown inside the YouTube embed, not as a standalone image
+        blocks.append({
+            'kind': 'image', 'html': _image_block_html(image.ref),
+            'image_src': image.ref, 'width': image.width, 'height': image.height,
+        })
+
+    # Audio/video attachments get an inline HTML5 player instead of a bare
+    # download link — same underlying PageFile/bytes (still uploaded via
+    # `page.files` like any attachment), just a different `kind` for the ones
+    # a caller can actually play back. No dedicated jcid exists for either;
+    # matched by filename extension, same as any other attachment type this
+    # package doesn't have a specific node shape for.
+    other_files = []
+    for f in files:
+        kind = _attachment_kind(os.path.splitext(f.filename)[1])
+        if kind == 'file':
+            other_files.append(f)
+        else:
+            blocks.append({'kind': kind, 'html': _media_block_html(kind, f.ref), f'{kind}_src': f.ref})
+    if other_files:
+        links = ''.join(
+            f'<p>\U0001F4CE <a href="{html.escape(f.ref, quote=True)}">{html.escape(f.filename)}</a></p>'
+            for f in other_files
+        )
+        blocks.append({'kind': 'file_links', 'html': links})
+
+    if ink_container_ids:
+        svg = onenote_ink.render_ink_containers(by_id, ink_container_ids, _norm_identity)
+        if svg:
+            if report is not None:
+                report.ok('ink_drawing', len(ink_container_ids))
+            blocks.append({'kind': 'ink', 'html': svg})
+        else:
+            if report is not None:
+                report.fail('ink_drawing')
+            blocks.append({
+                'kind': 'text',
+                'html': f'<p>{html.escape(_placeholder_text("a hand-drawn ink drawing", "could not be decoded"))}</p>',
+            })
+
+    # Drop text blocks that render as nothing visible — e.g. body_runs that
+    # turned out to be ONLY blank-line markers (kept upstream to preserve
+    # spacing between real content, but with no real content around them
+    # they're just an empty block). Image/audio/video/table/ink blocks are
+    # never dropped here even though they have no plain text.
+    return [
+        b for b in blocks
+        if b.get('kind') in ('image', 'audio', 'video') or _has_visible_content(b.get('html', ''))
+    ]
 
 
 def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] = None) -> tuple:
@@ -242,6 +314,9 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
     order_index, title_run_ids = _page_content_order(props, by_id)
     # Section page order (which page comes first), keyed by page object-space guid.
     page_order = _object_space_order(document, props, by_id)
+    # Each page's own floating boxes (canvas position) and which content sits
+    # in which one — see `models.PageRegion` / `ordering._page_regions`.
+    regions_by_page, content_region = _page_regions(props, by_id)
 
     groups = OrderedDict()  # guid -> {runs, images, files, date, time}
     image_counter = [0]
@@ -250,6 +325,11 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
     current_guid = None
     image_by_key = {}        # dedup_key -> index into image_records (keep larger)
     image_records = []       # (page_guid, near_guid, PageImage) assigned after grouping
+    # ref (image/file placeholder token) -> the originating prop's own identity,
+    # used only to look a ref up in `content_region` (see `_page_regions`) once
+    # regions are computed below — kept separate from PageImage/PageFile
+    # themselves so their public shape doesn't grow an internal-only field.
+    identity_by_ref = {}
 
     def group_for(guid):
         return groups.setdefault(guid, {'runs': [], 'images': [], 'files': [], 'date': None, 'time': None, 'run_ids': set()})
@@ -330,6 +410,8 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
             continue
 
         if ptype in _IMAGE_TYPES or ptype in _EMBED_TYPES:
+            own_identity = _norm_identity(prop.get('identity'))
+
             # An embedded-file node carries the REAL attached file separately
             # from its preview picture (EmbeddedFileContainer vs PictureContainer
             # — see _build_embedded_file). Extract it first so a spreadsheet/zip/
@@ -340,6 +422,7 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
                 embedded_file = _build_embedded_file(val, files_by_identity, file_counter, consumed_file_idents, report)
                 if embedded_file is not None:
                     group_for(current_guid)['files'].append(embedded_file)
+                    identity_by_ref[embedded_file.ref] = own_identity
 
             # The image's PictureContainer GUID equals its page's object space,
             # so it can be placed on the right page. Dedup across revisions and
@@ -371,11 +454,13 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
             if matched is not None:
                 if image.source_width > image_records[matched][2].source_width:
                     image_records[matched] = (page_guid, current_guid, image)  # prefer larger
+                    identity_by_ref[image.ref] = own_identity
                 report.fail('image_duplicate')
                 continue
             if dedup_key is not None:
                 image_by_key.setdefault(dedup_key, []).append(len(image_records))
             image_records.append((page_guid, current_guid, image))
+            identity_by_ref[image.ref] = own_identity
             report.ok('embedded_preview' if ptype in _EMBED_TYPES else 'image')
             continue
 
@@ -392,7 +477,7 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
                         seen_tables.add(tid)
                     grid = _resolve_table_grid(prop, by_id, grp.setdefault('table_consumed', set()))
                     if grid:
-                        grp.setdefault('tables', []).append(grid)
+                        grp.setdefault('tables', []).append((tid, grid))
             report.ok('table')
             continue
 
@@ -526,48 +611,12 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
         ]
         body_runs.sort(key=lambda r: order_index.get(r.get('rid'), 10 ** 9))
 
-        blocks = []
-
-        # Tables reconstructed from the object tree (correct cell placement).
-        for grid in grp.get('tables', []):
-            blocks.append({'kind': 'table', 'html': _table_html(grid)})
-
-        if body_runs:
-            blocks.append({'kind': 'text', 'html': _runs_to_paragraphs(body_runs)})
-        for image in grp['images']:
-            if image.ref in used_thumb_refs:
-                continue  # shown inside the YouTube embed, not as a standalone image
-            blocks.append({
-                'kind': 'image', 'html': _image_block_html(image.ref),
-                'image_src': image.ref, 'width': image.width, 'height': image.height,
-            })
-
-        if grp['files']:
-            links = ''.join(
-                f'<p>\U0001F4CE <a href="{html.escape(f.ref, quote=True)}">{html.escape(f.filename)}</a></p>'
-                for f in grp['files']
-            )
-            blocks.append({'kind': 'file_links', 'html': links})
-
         ink_container_ids = list(dict.fromkeys(grp.get('ink_container_ids') or []))
-        if ink_container_ids:
-            svg = onenote_ink.render_ink_containers(by_id, ink_container_ids, _norm_identity)
-            if svg:
-                report.ok('ink_drawing', len(ink_container_ids))
-                blocks.append({'kind': 'ink', 'html': svg})
-            else:
-                report.fail('ink_drawing')
-                blocks.append({
-                    'kind': 'text',
-                    'html': f'<p>{html.escape(_placeholder_text("a hand-drawn ink drawing", "could not be decoded"))}</p>',
-                })
-
-        # Drop text blocks that render as nothing visible — e.g. body_runs
-        # that turned out to be ONLY blank-line markers (kept upstream to
-        # preserve spacing between real content, but with no real content
-        # around them they're just an empty block). Image/table/ink blocks
-        # are never dropped here even though they have no plain text.
-        blocks = [b for b in blocks if b.get('kind') == 'image' or _has_visible_content(b.get('html', ''))]
+        tables = grp.get('tables', [])
+        files = grp.get('files', [])
+        blocks = _build_blocks(
+            body_runs, tables, grp['images'], ink_container_ids, files, by_id, used_thumb_refs, report=report,
+        )
 
         if not blocks and not title:
             continue  # empty group, skip
@@ -575,6 +624,30 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
         created_at = None
         if grp['date'] is not None:
             created_at = datetime.combine(grp['date'], grp['time'] or dt_time(0, 0))
+
+        # Floating-region view of the SAME content (see `models.PageRegion`):
+        # partition this page's already-collected runs/tables/images/ink/
+        # files by which top-level outline box (`content_region`, from
+        # `ordering._page_regions`) each one structurally belongs to, and
+        # render each subset through the exact same `_build_blocks` used
+        # above. `report=None` here — the whole-page call above already
+        # tallied ink drawings; rendering the same drawing again into its
+        # region's own blocks must not double-count it. A region that
+        # resolves to no content (nothing in `content_region` pointed at it)
+        # is dropped rather than included empty.
+        regions = []
+        for rmeta in regions_by_page.get(_guid, []):
+            rguid = rmeta['guid']
+            r_runs = [r for r in body_runs if content_region.get(r.get('rid')) == rguid]
+            r_tables = [t for t in tables if content_region.get(t[0]) == rguid]
+            r_images = [img for img in grp['images'] if content_region.get(identity_by_ref.get(img.ref)) == rguid]
+            r_ink_ids = [i for i in ink_container_ids if content_region.get(i) == rguid]
+            r_files = [f for f in files if content_region.get(identity_by_ref.get(f.ref)) == rguid]
+            r_blocks = _build_blocks(r_runs, r_tables, r_images, r_ink_ids, r_files, by_id, used_thumb_refs)
+            if r_blocks:
+                regions.append(PageRegion(
+                    x=rmeta['x'], y=rmeta['y'], width=rmeta['width'], height=rmeta['height'], blocks=r_blocks,
+                ))
 
         pages.append((
             page_order.get(_guid, 10 ** 9),
@@ -584,8 +657,9 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
                 block_count=len(blocks),
                 created_at=created_at,
                 images=grp['images'],
-                files=grp.get('files', []),
+                files=files,
                 sub_level=max(0, page_level_by_guid.get(_guid, page_levels.get(title, 1)) - 1),
+                regions=regions,
             ),
         ))
 
