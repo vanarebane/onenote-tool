@@ -116,35 +116,179 @@ became a `background-color` style on the `<td>`. All verified against a
 real table with colored cells, per-cell and per-run alignment, and list
 items inside cells.
 
-**Merged cells: investigated, not implemented, real reason.** OneNote's own
-MHT export resolves a merged cell to a real `<td colspan=2>` — genuine
-merge information clearly exists internally — but an exhaustive check of
-every `jcidTableNode`/`jcidTableRowNode`/`jcidTableCellNode` property this
-tool can read (pyOneNote's own property-name table, cross-referenced
-against every property that actually appears on a real merged cell) found
-no span/merge count anywhere. What IS observed: a merged cell's content is
-literally duplicated — TWO separate `jcidRichTextOENode` objects, different
-identities, identical text — one physically sitting in each of the cells
-the merge visually spans. Detecting a merge by comparing adjacent cells'
-content for equality was considered and rejected: it's exactly the shape of
-unverified heuristic that caused the "sibling consensus" regression
-documented elsewhere in this file — legitimately-duplicate, non-merged cell
-content (e.g. two cells that both happen to say "N/A") would be
-indistinguishable from a real merge by that signal alone. Current output
-shows the duplicated content in both cells rather than collapsing it —
-correct data, wrong shape, not silently lost.
+**Merged cells: implemented, real structural signal found (not a
+heuristic).** OneNote's own MHT export resolves a merged cell to a real
+`<td colspan=2>` — genuine merge information clearly exists internally —
+and an earlier pass at this looked for it and gave up: an exhaustive check
+of every property this tool could **name** (pyOneNote's own
+`_property_id_name_mapping`, cross-referenced against everything visible on
+a real merged cell) found nothing. The mistake was trusting that name
+table as complete. It isn't — `PropertySet.get_properties()` silently drops
+any property whose raw ID isn't in pyOneNote's small hardcoded dict
+(decodes as the string `"Unknown"`, filtered out before a caller ever sees
+it; `ink.py` already had to work around this same gap for undocumented ink
+properties). Dumping every **raw** property ID on every real
+`jcidTableCellNode` in the test file (bypassing `get_properties()` via the
+raw `PropertySet` body kept on `prop['body']`, the same escape hatch
+`ink.py` uses) turned up an ID pyOneNote has no name for at all
+(`0x140035DD`) that appears on exactly the cells involved in a merge and
+nowhere else: absent on every ordinary cell; on each of the file's three
+real merges, the first (content-bearing) cell carries the value `2` (its
+own column span — every merge in the test file happened to span exactly 2
+columns, so a 3+-column span is unverified but the mechanism generalizes),
+and the following, absorbed cell carries `0`. This is a genuine structural
+signal, not the content-equality heuristic considered and rejected earlier
+(comparing adjacent cells' text — the same failure shape as the "sibling
+consensus" regression documented elsewhere in this file, since two
+legitimately-different cells that happen to hold equal text, e.g. two
+"N/A"s, would be indistinguishable from a real merge by that signal alone).
+`rendering._cell_merge_span` reads it; `_resolve_table_grid` drops any
+`0`-valued cell from its row and gives the preceding cell a real `colspan`
+attribute. Verified against all three real merges in the test file
+(including one where the merged cell holds a pasted image, not text) —
+output now matches the MHT ground truth's `<td colspan="2">` exactly.
 
-**Images inside a table cell**: not implemented — a real test cell with an
-embedded picture currently contributes nothing to that cell's HTML (image
-extraction only ever runs at the page level, with no path back to "which
-cell is this in"). Verified this specific gap couldn't be double-checked
-end-to-end this session: the one real image inside a table cell added to
-the test file appeared in a same-day `.mht` re-export but not in the
-`.onepkg` export taken ~2 minutes earlier (timestamps confirm the `.onepkg`
-predates the image being added) — so its absence from this tool's own
-output is expected for THAT specific file, not evidence one way or the
-other about whether the extraction gap itself has been fixed. Still a real,
-known gap either way.
+**Images inside a table cell: implemented and verified (normal sections
+only).** A picture pasted directly into a cell is a plain `jcidImageNode`
+there too, reached the same way a cell's text runs are (`_child_ids` tree
+walk) — `rendering._collect_cell_runs` now recognizes it and extracts it
+via a caller-supplied `image_builder` callback (`parser.py` binds this to
+the same `_build_page_image` the page-level path already uses; not wired
+into `recovery.py` at all, since tables there are the confirmed 0%-decode
+dead end above — nothing to attach an image to). Two real bugs found and
+fixed while verifying this against the actual test cell (which turned out
+to be present in the `.onepkg` after all, not absent as first suspected):
+
+- **Double extraction.** The exact same image was being extracted TWICE —
+  once by the main per-page loop's own generic image handling (landing as
+  a stray page-level image via the near_guid fallback), once via the new
+  cell walk (landing correctly in its cell) — same bytes, two `PageImage`s,
+  two ref tokens. Fixed by tracking which identities were claimed by a
+  cell (`cell_image_idents`) and dropping any top-level image record that
+  matches one before page assignment.
+- **Shared-accumulator leak.** `_resolve_table_grid` shares ONE `images`
+  list across every cell in a table (so the caller gets the table's full
+  total) — but `_resolve_cell_html` was rendering a cell's own `<img>` tags
+  by iterating that SAME shared list, so a cell with no image of its own
+  rendered whatever an EARLIER cell in the same table had already added.
+  Verified on the real merged-cell row: the cell with no picture rendered
+  the neighboring cell's picture a second time. Fixed by giving each cell
+  its own local list for rendering, only feeding results back into the
+  shared accumulator afterward.
+
+## A real pyOneNote bug dropped every True-valued boolean property
+
+Found while chasing table-level styling (`TableBordersVisible`, below) but
+much bigger than tables: **every boolean property, whenever its value was
+`True`, was being silently dropped** — Bold, Italic, Underline,
+Strikethrough, Superscript, Subscript, `TableBordersVisible`,
+`EnableHistory`, `OutlineElementRTL`, all of them, project-wide, in every
+section (not protected-content-specific).
+
+Root cause: [MS-ONESTORE] 2.6.14 packs a Bool-type property's actual value
+into bit 31 of the PropertyID itself (`PropertyID.boolValue`), not as
+separate data. pyOneNote's `_property_id_name_mapping` is keyed on the
+**full** 32-bit ID, but only ever registers the bit-31-clear (False) form —
+the bit-31-set (True) form of e.g. `Bold` is a completely different integer
+that was never added to the dict, so it decodes to the name `"Unknown"` and
+`get_properties()` throws it away before any caller ever sees it (same
+`get_properties()`-drops-`"Unknown"` gap the merged-cell fix above found).
+Since OneNote only ever writes a boolean property when it overrides the
+(always-False) default, this meant essentially every real occurrence of
+every boolean formatting property in the wild was invisible.
+
+Measured on the real test file, before vs. after masking bit 31 off before
+the name lookup (`_patches.py`'s `_bool_aware_get_property_name`, patching
+`PropertyID.get_property_name`): `Bold` appeared 25 times in decoded
+properties, **0 of them `True`**, before the fix; after, 5 of those 25
+correctly read `True`, and `Italic`/`Underline`/`Strikethrough` — previously
+invisible in their `True` form entirely — appeared for the first time too.
+Cross-checked against the MHT ground truth's `font-weight:bold` spans (a
+"Lorem Ipsum" paragraph, several table header cells) — the tool's `<strong>`
+output now lands on exactly the same text. Bit 31 is spec-reserved (0) for
+every non-Bool property type, so masking it off is a no-op everywhere else
+— verified via full test suite + unchanged page counts on all three real
+sections before/after.
+
+## Table-level styling: column widths and border visibility, implemented
+
+Both real properties this project's Table A previously listed as "found,
+not exposed":
+
+- **`TableBordersVisible`** only needed the boolean-property fix above —
+  it's a perfectly ordinary named property once its `True` form stops
+  getting dropped. `rendering._table_borders_visible` reads it from `val`
+  directly.
+- **`TableColumnWidths`** needed its own fix. It's a variable-length blob
+  (byte 0 = column count, then that many little-endian float32 values, one
+  per column, in the same "half-inch units" `PropertySet
+  .half_inch_size_to_pixels` already converts every other width/height
+  property with elsewhere) — but `get_properties()`'s generic fallback for
+  a blob property that isn't a GUID is `.decode('utf-16')`, and only
+  `.hex()` if THAT raises. A short/unlucky byte pattern can decode as
+  UTF-16 successfully and produce mojibake instead of raising — observed
+  directly on the sibling property `TableColumnsLocked` (same blob shape),
+  which came back as an unprintable character instead of hex. Not a
+  reliable string to parse either way. `rendering._table_column_widths_px`
+  reads the raw bytes straight off `prop['body']` instead (the same escape
+  hatch the merged-cell fix and `ink.py` use) and decodes the count-prefixed
+  float array directly. Verified against a real 8-column employee-data
+  table: decoded widths (px) were `[49.5, 117.4, 80.7, 85.4, 91.9, 49.5,
+  50.4, 49.5]` for columns ID / Name / Department / City / "Join Date" /
+  Salary / Status / (blank) — narrow for short fields, wide for names and
+  the date column, exactly matching what the real table looks like.
+
+Both are baked directly into `_table_html`'s output as inline styling — a
+`<colgroup>` of `<col style="width:...px">` (an HTML `<table>`'s default
+column sizing is otherwise content-driven and ignores OneNote's widths
+entirely) and, only when borders are explicitly ON, `border-collapse` +
+a real per-cell border (an HTML table has no border by default, which
+already matches a OneNote table with borders explicitly hidden — no
+styling needed for that half). Same "additive inline CSS, no new schema
+field" convention already used for cell background-color and paragraph
+alignment. `TableColumnsLocked` (an editing-lock bitmask, not visible
+content) was deliberately left unexposed — its semantics are unverified and
+it doesn't affect what a converted page looks like.
+
+## Table-cell formatting had a real, now-fixed performance cost
+
+Resolving formatting for every table cell (the fix above) made
+`text._as_bytes` a genuine hot path — it used to go through
+`ast.literal_eval` (full `compile()` + AST parse) for every 2-16-byte
+property value, cheap enough to ignore when only a handful of runs per
+page needed it, but a real cost once every cell's every run started
+resolving font-size/color/alignment. Measured: **21.7s to parse a 396KB
+section**, almost entirely `compile()` time. Fixed by switching to
+`codecs.escape_decode` (the same escape-sequence parser CPython itself
+uses for a bytes literal, ~375x faster on real samples, verified
+byte-identical output) — same section now parses in 0.2s.
+
+**A second, separate slowdown was found while chasing this — now also
+fixed**: parsing the password-protected section alone took ~39s. Root
+cause, found via `cProfile` on `parse_one_file`'s first pass in isolation
+(the marker-detection-only pass — reads every `FileNode` on the raw,
+still-encrypted bytes just to learn whether the section carries an
+`ObjectDataEncryptionKeyV2FNDX` marker, before any password/shadow-decrypt
+work even starts): a type-0x7 property (`PrtFourBytesOfLengthFollowedByData`
+— a variable-length blob) decodes its 4-byte length prefix from ciphertext
+too, so on real encrypted content that length comes out as near-random
+32-bit garbage. pyOneNote's own (unpatched) code responds to that by doing
+`file.read(cb)` unconditionally — materializing and copying up to that many
+bytes (bounded only by EOF) — and this single call site accounted for
+**~33 of the pass's ~34 seconds** (94 calls, profiled on the real test
+file), dwarfing everything else, including the `_as_bytes` cost above.
+Nothing in this marker-only pass ever reads the resulting `.Data` (the
+whole pass exists only to set `_saw_encryption_marker`, which is decided
+by the FileNode's own type, not by any property value) — so during this
+pass specifically, `_patches.py` now `seek`s past the claimed length
+instead of reading it (same cursor effect for sibling properties, none of
+the copy cost). Scoped strictly to the marker-probe pass via the existing
+`_active_marker_probe` flag; the real shadow-decrypt second pass, and every
+unprotected-file parse, are untouched. Verified byte-identical
+`PageResult` output (all three real test sections) and unchanged
+`password_status` (`needs_password`/`wrong_password` cases included) before
+vs. after, by toggling just this one patch in isolation. Real-file result:
+**~39s to ~1.7s** for the password-protected section.
 
 ## Password-protected recovery has a real, not-yet-closed ceiling
 

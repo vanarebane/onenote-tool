@@ -38,6 +38,11 @@ from . import decrypt as onenote_decrypt
 # pyOneNote itself is available — see module docstring.
 _active_shadow = [None]
 _active_decrypt = [None]
+# When True, `_filenode_init` skips PropertySet construction entirely (see
+# its own comment) — used for `parser.parse_one_file`'s first,
+# marker-detection-only pass over a section, before it's known whether the
+# file is password-protected.
+_active_marker_probe = [False]
 
 
 class PyOneNoteUnavailable(RuntimeError):
@@ -148,6 +153,65 @@ try:  # pyOneNote is a required dependency at parse time, but importing
 
     _pyonenote_filenode.PropertySet.get_compact_ids = staticmethod(_capped_get_compact_ids)
 
+    # Real perf bug found and fixed: the marker-probe pass (see
+    # `_active_marker_probe` below) reads every PropertySet on a protected
+    # section's raw ciphertext just to learn `_saw_encryption_marker` (which
+    # doesn't need any of this — it's set by `_encryption_key_fnd_fix`, off
+    # the FileNode's own type). Type-0x7 properties (PrtFourBytesOfLength-
+    # FollowedByData — variable-length blobs) decode their length prefix
+    # from ciphertext too, so `cb` comes out as near-random 32-bit garbage
+    # on real files; the ORIGINAL code unconditionally does
+    # `file.read(cb)`, materializing and copying up to that many bytes
+    # (bounded only by EOF) — measured as the actual bottleneck of the probe
+    # pass on a real protected section (94 calls, ~33s of a ~34s pass,
+    # profiled with cProfile). Nothing in the probe pass ever reads
+    # `.Data` afterward, so during probe mode skip straight to a `seek`
+    # instead of a `read` — same cursor effect (needed so sibling
+    # properties in the same PropertySet keep resolving at the right
+    # offset), none of the copy cost. Scoped strictly to probe mode: normal
+    # parses (including pass 2's real shadow-decrypted read) are untouched.
+    _orig_prt_four_bytes_init = _pyonenote_filenode.PrtFourBytesOfLengthFollowedByData.__init__
+
+    def _capped_prt_four_bytes_init(self, file, propertySet):
+        if _active_marker_probe[0]:
+            self.cb, = struct.unpack('<I', file.read(4))
+            self.Data = b''
+            file.seek(self.cb, 1)
+            return
+        _orig_prt_four_bytes_init(self, file, propertySet)
+
+    _pyonenote_filenode.PrtFourBytesOfLengthFollowedByData.__init__ = _capped_prt_four_bytes_init
+
+    # pyOneNote bug fix: a type-0x2 (Bool) PropertyID stores its VALUE inline,
+    # in bit 31 of the property ID itself ([MS-ONESTORE] 2.6.14 —
+    # PropertyID.boolValue), not as separate data. `_property_id_name_mapping`
+    # is keyed on the FULL 32-bit ID including that bit, but only ever has an
+    # entry for bit31=0 (False) — so a True instance of ANY boolean property
+    # (Bold, Italic, Underline, Strikethrough, Superscript, Subscript,
+    # TableBordersVisible, EnableHistory, OutlineElementRTL, ...) hashes to a
+    # value that was never registered, decodes as the name "Unknown", and
+    # `get_properties()` silently drops it (see its own `if propertyName !=
+    # 'Unknown'` filter). Since OneNote only ever WRITES a boolean property
+    # when it overrides the (always-False) default, this meant essentially
+    # every real occurrence of every boolean formatting property was being
+    # thrown away. Confirmed on a real file: before this fix, `Bold` appeared
+    # 25 times in decoded properties and every single one read `False`
+    # (0 `True`); with it, 5 of those 25 correctly read `True`, and
+    # `Italic`/`Underline`/`Strikethrough`/`TableBordersVisible` — previously
+    # invisible in `val` in their True form — appeared for the first time.
+    # Masking bit 31 off before the name lookup (falling back to the
+    # unmasked value, so any genuinely-unknown property still resolves to
+    # "Unknown" as before) fixes every boolean property in one place; bit 31
+    # is spec-reserved/0 for every non-Bool type, so this is a no-op for
+    # every other property.
+    def _bool_aware_get_property_name(self):
+        mapping = self._property_id_name_mapping
+        if self.value in mapping:
+            return mapping[self.value]
+        return mapping.get(self.value & 0x7FFFFFFF, 'Unknown')
+
+    _pyonenote_filenode.PropertyID.get_property_name = _bool_aware_get_property_name
+
     # pyOneNote gap: only ObjectDeclaration2RefCountFND reads its property set,
     # and get_properties() lists only that node type. OneNote stores shared
     # character/paragraph style containers (bold/italic/color/highlight/heading,
@@ -178,6 +242,30 @@ try:  # pyOneNote is a required dependency at parse time, but importing
         self._structural_start = file.tell()
         _orig_filenode_init(self, file, document)
         _encryption_key_fnd_fix(self, file, document)
+        if _active_marker_probe[0]:
+            # Real perf bug found and fixed: `parse_one_file`'s first pass
+            # exists ONLY to learn `_saw_encryption_marker`/`_encryption_blob`
+            # (both already set above, by `_encryption_key_fnd_fix`, which
+            # doesn't need a PropertySet at all — it fires on the FileNode's
+            # own TYPE). Building every OTHER node's PropertySet during this
+            # pass anyway used to burn real time on a real file — 37s for
+            # one section — for values that get thrown away unconditionally:
+            # either the file turns out protected (this pass's decoded
+            # values are ciphertext garbage no caller ever reads — pass 2
+            # rebuilds everything through the shadow buffer) or unprotected
+            # (`parse_one_file` reruns this same construction with this flag
+            # off, since THAT'S the only pass an unprotected file gets).
+            # This `return` only skips the EXTRA PropertySet construction
+            # this patch adds below (for ReadOnly* declaration types
+            # pyOneNote itself doesn't handle) — it does NOT prevent
+            # `_orig_filenode_init` above from building a PropertySet the
+            # way it normally would for `ObjectDeclaration2RefCountFND`
+            # nodes (pyOneNote's own, unconditional code path, un-gated).
+            # That path turned out to hold the REAL cost, and specifically
+            # not in the property-set attempt-chain logic itself but in one
+            # call it makes: see `_capped_prt_four_bytes_init` above, which
+            # is where the actual ~33s/34s was found and fixed.
+            return
         if hasattr(self, 'propertySet'):
             return
         data = getattr(self, 'data', None)

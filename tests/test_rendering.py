@@ -1,5 +1,7 @@
+from onenote_tool.models import PageImage
 from onenote_tool.rendering import (
     _apply_marks,
+    _cell_merge_span,
     _font_size_pt,
     _has_visible_content,
     _image_block_html,
@@ -10,9 +12,38 @@ from onenote_tool.rendering import (
     _render_list,
     _resolve_cell_html,
     _resolve_run_format,
+    _resolve_table_grid,
     _runs_to_paragraphs,
+    _table_borders_visible,
+    _table_column_widths_px,
     _table_html,
 )
+
+
+class _FakePrid:
+    def __init__(self, value):
+        self.value = value
+
+
+class _FakeBody:
+    """Stands in for pyOneNote's real PropertySet body — just enough shape
+    (`rgPrids`/`rgData` in parallel, `.value` on each prid) for `_cell_merge_span`
+    to walk, same as the real object `_patches._get_properties` keeps on
+    `prop['body']`."""
+
+    def __init__(self, pairs):
+        self.rgPrids = [_FakePrid(k) for k, _ in pairs]
+        self.rgData = [v for _, v in pairs]
+
+
+class _FakeBlob:
+    """Stands in for pyOneNote's `PrtFourBytesOfLengthFollowedByData` — a
+    variable-length property's raw bytes live on `.Data`, not in `rgData`
+    directly (unlike a fixed-size property like the merge span, see
+    `_FakeBody` above)."""
+
+    def __init__(self, data):
+        self.Data = data
 
 
 def test_apply_marks_bold_italic():
@@ -190,6 +221,143 @@ def test_table_html_empty_cell_falls_back_to_empty_paragraph():
     assert out == '<table><tr><td><p></p></td></tr></table>'
 
 
+def test_table_html_colspan_attribute():
+    grid = [[{'html': '<p>a</p>', 'color': None, 'colspan': 2}]]
+    out = _table_html(grid)
+    assert out == '<table><tr><td colspan="2"><p>a</p></td></tr></table>'
+
+
+def test_table_html_colspan_one_omits_attribute():
+    grid = [[{'html': '<p>a</p>', 'color': None, 'colspan': 1}]]
+    out = _table_html(grid)
+    assert out == '<table><tr><td><p>a</p></td></tr></table>'
+
+
+def test_table_borders_visible_true():
+    prop = {'val': {'TableBordersVisible': 'True'}}
+    assert _table_borders_visible(prop) is True
+
+
+def test_table_borders_visible_false():
+    prop = {'val': {'TableBordersVisible': 'False'}}
+    assert _table_borders_visible(prop) is False
+
+
+def test_table_borders_visible_absent_is_none():
+    assert _table_borders_visible({'val': {}}) is None
+    assert _table_borders_visible(None) is None
+
+
+def test_table_column_widths_px_decodes_real_shape():
+    # Real raw bytes for a 3-column table (count byte + 3 little-endian
+    # float32 "half-inch units", the same convention pyOneNote's own
+    # `half_inch_size_to_pixels` uses elsewhere) — verified against a real
+    # merged-cell table (widths ~123/261/249px).
+    import struct
+    floats = struct.pack('<3f', 2.5586109161376953, 5.433963298797607, 5.188507556915283)
+    raw = bytes([3]) + floats
+    prop = {'body': _FakeBody([(0x1C001D66, _FakeBlob(raw))])}
+    assert _table_column_widths_px(prop) == [122.8, 260.8, 249.0]
+
+
+def test_table_column_widths_px_absent_is_none():
+    assert _table_column_widths_px({'body': _FakeBody([])}) is None
+    assert _table_column_widths_px(None) is None
+
+
+def test_table_column_widths_px_implausible_count_is_ignored():
+    raw = bytes([250]) + b'\x00' * 4  # count byte says 250 columns, no data to back it
+    prop = {'body': _FakeBody([(0x1C001D66, _FakeBlob(raw))])}
+    assert _table_column_widths_px(prop) is None
+
+
+def test_table_html_with_visible_borders_and_widths():
+    import struct
+    raw = bytes([1]) + struct.pack('<f', 1.0)  # 1 column, 48px
+    table_prop = {
+        'val': {'TableBordersVisible': 'True'},
+        'body': _FakeBody([(0x1C001D66, _FakeBlob(raw))]),
+    }
+    grid = [[{'html': '<p>a</p>', 'color': None, 'colspan': 1}]]
+    out = _table_html(grid, table_prop)
+    assert out == (
+        '<table style="border-collapse:collapse">'
+        '<colgroup><col style="width:48.0px"></colgroup>'
+        '<tr><td style="border:1px solid #999"><p>a</p></td></tr></table>'
+    )
+
+
+def test_table_html_hidden_borders_gets_no_border_style():
+    table_prop = {'val': {'TableBordersVisible': 'False'}}
+    grid = [[{'html': '<p>a</p>', 'color': None, 'colspan': 1}]]
+    out = _table_html(grid, table_prop)
+    assert out == '<table><tr><td><p>a</p></td></tr></table>'
+
+
+def test_cell_merge_span_absent_property_returns_none():
+    prop = {'body': _FakeBody([(0x08001C04, b'\x01')])}  # some unrelated property (Bold)
+    assert _cell_merge_span(prop) is None
+
+
+def test_cell_merge_span_no_body_returns_none():
+    assert _cell_merge_span({'val': {}}) is None
+    assert _cell_merge_span(None) is None
+
+
+def test_cell_merge_span_reads_raw_unnamed_property():
+    # Real raw PropertyID (0x140035DD) pyOneNote's own name table doesn't
+    # know at all — decodes as "Unknown" and is dropped by get_properties(),
+    # so this can only be read via the raw `body`, same as ink.py's
+    # undocumented ink properties.
+    prop = {'body': _FakeBody([(0x140035DD, b'\x02\x00\x00\x00')])}
+    assert _cell_merge_span(prop) == 2
+
+
+def test_cell_merge_span_zero_means_absorbed():
+    prop = {'body': _FakeBody([(0x140035DD, b'\x00\x00\x00\x00')])}
+    assert _cell_merge_span(prop) == 0
+
+
+def test_cell_merge_span_implausible_value_is_ignored():
+    prop = {'body': _FakeBody([(0x140035DD, (999).to_bytes(4, 'little'))])}
+    assert _cell_merge_span(prop) is None
+
+
+def test_resolve_table_grid_merged_cell_gets_colspan_and_absorbed_cell_is_dropped():
+    table_guid = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+    row_guid = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+    first_guid = 'cccccccc-cccc-cccc-cccc-cccccccccccc'
+    merged_guid = 'dddddddd-dddd-dddd-dddd-dddddddddddd'
+    absorbed_guid = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
+    by_id = {
+        f'{table_guid},1': {
+            'type': 'jcidTableNode',
+            'val': {'ElementChildNodesOfVersionHistory': [f'<ExtendedGUID> ({row_guid}, 1)']},
+        },
+        f'{row_guid},1': {
+            'type': 'jcidTableRowNode',
+            'val': {'ElementChildNodesOfVersionHistory': [
+                f'<ExtendedGUID> ({first_guid}, 1)',
+                f'<ExtendedGUID> ({merged_guid}, 1)',
+                f'<ExtendedGUID> ({absorbed_guid}, 1)',
+            ]},
+        },
+        f'{first_guid},1': {'type': 'jcidTableCellNode', 'val': {}},
+        f'{merged_guid},1': {
+            'type': 'jcidTableCellNode', 'val': {},
+            'body': _FakeBody([(0x140035DD, b'\x02\x00\x00\x00')]),
+        },
+        f'{absorbed_guid},1': {
+            'type': 'jcidTableCellNode', 'val': {},
+            'body': _FakeBody([(0x140035DD, b'\x00\x00\x00\x00')]),
+        },
+    }
+    grid = _resolve_table_grid(by_id[f'{table_guid},1'], by_id, set())
+    assert len(grid[0]) == 2  # absorbed cell dropped
+    assert grid[0][0]['colspan'] == 1
+    assert grid[0][1]['colspan'] == 2
+
+
 def test_has_visible_content_with_text():
     assert _has_visible_content('<p>hello</p>') is True
 
@@ -262,3 +430,61 @@ def test_resolve_cell_html_renders_a_list():
     by_id = {f'{guid},1': {'type': 'jcidRichTextOENode', 'val': {'TextExtendedAscii': '4f6e65'}}}  # "One"
     out = _resolve_cell_html(f'{guid},1', by_id, set(), list_runs={f'{guid},1': {'ordered': False, 'level': 0}})
     assert out == '<ul><li><p>One</p></li></ul>'
+
+
+def _fake_image(ref: str) -> PageImage:
+    return PageImage(ref=ref, data=b'x', ext='.png', width=10, height=10)
+
+
+def test_resolve_cell_html_renders_an_image():
+    guid = '55555555-5555-5555-5555-555555555555'
+    by_id = {f'{guid},1': {'type': 'jcidImageNode', 'val': {}}}
+    images = []
+    counter = [0]
+
+    def builder(_nid, _val):
+        counter[0] += 1
+        return _fake_image(f'onenote-image://{counter[0]}')
+
+    out = _resolve_cell_html(f'{guid},1', by_id, set(), image_builder=builder, images=images)
+    assert out == '<img src="onenote-image://1" alt="">'
+    assert len(images) == 1 and images[0].ref == 'onenote-image://1'
+
+
+def test_resolve_table_grid_image_does_not_leak_into_sibling_cell():
+    # Real bug, verified against a real 3-cell row: `_resolve_table_grid`
+    # passes ONE shared `images` accumulator across every cell in a table
+    # (so the caller gets the table's full total) — but a cell with no
+    # image of its own used to render whatever image an EARLIER cell in the
+    # same table had already added to that shared list, because the
+    # rendering loop iterated the shared list instead of just this cell's
+    # own finds.
+    table_guid = '66666666-6666-6666-6666-666666666666'
+    row_guid = '77777777-7777-7777-7777-777777777777'
+    img_guid = '88888888-8888-8888-8888-888888888888'
+    empty_guid = '99999999-9999-9999-9999-999999999999'
+    by_id = {
+        f'{table_guid},1': {
+            'type': 'jcidTableNode',
+            'val': {'ElementChildNodesOfVersionHistory': [f'<ExtendedGUID> ({row_guid}, 1)']},
+        },
+        f'{row_guid},1': {
+            'type': 'jcidTableRowNode',
+            'val': {'ElementChildNodesOfVersionHistory': [
+                f'<ExtendedGUID> ({img_guid}, 1)', f'<ExtendedGUID> ({empty_guid}, 1)',
+            ]},
+        },
+        f'{img_guid},1': {'type': 'jcidImageNode', 'val': {}},
+        f'{empty_guid},1': {'type': 'jcidTableCellNode', 'val': {}},
+    }
+    counter = [0]
+
+    def builder(_nid, _val):
+        counter[0] += 1
+        return _fake_image(f'onenote-image://{counter[0]}')
+
+    images = []
+    grid = _resolve_table_grid(by_id[f'{table_guid},1'], by_id, set(), image_builder=builder, images=images)
+    assert len(images) == 1
+    assert '<img' in grid[0][0]['html']
+    assert '<img' not in grid[0][1]['html']

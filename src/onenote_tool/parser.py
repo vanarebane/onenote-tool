@@ -17,7 +17,7 @@ from typing import Optional
 
 from . import decrypt as onenote_decrypt
 from . import ink as onenote_ink
-from ._patches import OneDocment, _active_decrypt, _active_shadow, check_valid, require_pyonenote
+from ._patches import OneDocment, _active_decrypt, _active_marker_probe, _active_shadow, check_valid, require_pyonenote
 from .images import (
     _DHASH_THUMB_MATCH, _FILE_PLACEHOLDER, _IMAGE_EXTS, _IMAGE_PLACEHOLDER, _IMAGE_TYPES,
     _attachment_kind, _build_embedded_file, _build_page_image, _dham, _same_image, _youtube_from_rtu,
@@ -99,8 +99,8 @@ def _build_blocks(runs, tables, images, ink_container_ids, files, by_id, used_th
     """
     blocks = []
 
-    for _tid, grid in tables:
-        blocks.append({'kind': 'table', 'html': _table_html(grid)})
+    for tid, grid in tables:
+        blocks.append({'kind': 'table', 'html': _table_html(grid, by_id.get(tid))})
 
     if runs:
         blocks.append({'kind': 'text', 'html': _runs_to_paragraphs(runs)})
@@ -191,7 +191,19 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
         if not check_valid(fh):
             raise RuntimeError('not a valid OneNote .one file')
         fh.seek(0)
-        document = OneDocment(fh)
+        # First pass: marker-detection only (see `_patches._filenode_init`'s
+        # `_active_marker_probe` branch) — this pass's only job is learning
+        # `_saw_encryption_marker`/`_encryption_blob`, both set independently
+        # of PropertySet construction, so skip building one for every object
+        # in the file. A GENUINELY unprotected file needs a real second pass
+        # below (this probe skipped every PropertySet, so it has no usable
+        # content) — a protected file does too, but the existing shadow-
+        # decrypt pass just below already provides it.
+        _active_marker_probe[0] = True
+        try:
+            document = OneDocment(fh)
+        finally:
+            _active_marker_probe[0] = False
 
         if getattr(document, '_saw_encryption_marker', False) and candidates:
             blob = getattr(document, '_encryption_blob', None)
@@ -229,6 +241,21 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
                 finally:
                     _active_shadow[0] = None
                     _active_decrypt[0] = None
+        elif not getattr(document, '_saw_encryption_marker', False):
+            # Genuinely unprotected — the probe pass above skipped every
+            # PropertySet, so this is the ONLY pass an unprotected file
+            # gets; do it for real now, with the probe flag off (already
+            # reset in the `finally` above).
+            fh.seek(0)
+            document = OneDocment(fh)
+        # else: protected, but no usable password (no candidates supplied,
+        # or none matched) — the probe-pass `document` is fine as-is here.
+        # `get_json()` below will report every property as empty (nothing
+        # was ever decoded — same shape ciphertext already failing to
+        # decode would produce without this probe/reparse split at all),
+        # and every downstream use of it just needs to see "no real content
+        # resolved" to correctly report wrong_password/needs_password
+        # further down — it never reads a real value from it.
 
         data = document.get_json()
         files_by_identity = {}
@@ -330,6 +357,21 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
     # regions are computed below — kept separate from PageImage/PageFile
     # themselves so their public shape doesn't grow an internal-only field.
     identity_by_ref = {}
+    # Identities of images already extracted via a table cell (see the
+    # TABLE_TYPES branch below) — real bug found and fixed: without this,
+    # the SAME jcidImageNode got extracted TWICE, once by this loop's own
+    # generic IMAGE_TYPES branch (landing as a stray page-level image via
+    # the near_guid fallback) and once via the cell tree-walk (landing
+    # correctly inside its actual cell) — two PageImage copies of the same
+    # picture, two ref tokens, same bytes. `image_records` entries whose
+    # identity ends up in here are dropped before page assignment below.
+    cell_image_idents = set()
+
+    def _cell_image_builder(nid, val):
+        image = _build_page_image(val, files_by_identity, image_counter, report)
+        if image is not None:
+            cell_image_idents.add(nid)
+        return image
 
     def group_for(guid):
         return groups.setdefault(guid, {'runs': [], 'images': [], 'files': [], 'date': None, 'time': None, 'run_ids': set()})
@@ -489,9 +531,23 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
                 if tid is None or tid not in seen_tables:
                     if tid is not None:
                         seen_tables.add(tid)
-                    grid = _resolve_table_grid(prop, by_id, grp.setdefault('table_consumed', set()), list_runs)
+                    # A picture pasted directly into a cell is a plain
+                    # jcidImageNode there too, same as a page-level image —
+                    # `_build_page_image` needs no cell-specific handling,
+                    # just wiring in (real bug fixed: these used to
+                    # contribute nothing to the cell at all, not even a
+                    # placeholder — the image's own bytes were extracted
+                    # correctly by nothing, since only the main per-page
+                    # loop below ever called `_build_page_image`, and it
+                    # never runs on a node found via this tree walk).
+                    cell_images = []
+                    grid = _resolve_table_grid(
+                        prop, by_id, grp.setdefault('table_consumed', set()), list_runs,
+                        _cell_image_builder, cell_images,
+                    )
                     if grid:
                         grp.setdefault('tables', []).append((tid, grid))
+                        grp['images'].extend(cell_images)
             report.ok('table')
             continue
 
@@ -545,6 +601,14 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
                     # regression this gate prevents.
                     ink_guid = ident.split(',')[0] or current_guid
                     group_for(ink_guid).setdefault('ink_container_ids', []).append(ident)
+
+    # Drop any top-level image record whose SAME identity was already
+    # extracted via a table cell above — see `cell_image_idents`'s comment.
+    if cell_image_idents:
+        image_records = [
+            (pg, ng, img) for pg, ng, img in image_records
+            if identity_by_ref.get(img.ref) not in cell_image_idents
+        ]
 
     # Assign each image to its page: prefer the page whose GUID matches the
     # image's PictureContainer GUID, else the nearest preceding text page, else

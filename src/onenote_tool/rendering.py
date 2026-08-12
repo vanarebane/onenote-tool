@@ -8,12 +8,94 @@ from __future__ import annotations
 
 import html
 import re
+import struct
 from typing import Optional
 
 from .stamps import _is_stamp
 from .text import _as_bytes, _clean_text, _le_int, _norm_identity, decode_run_text
 
 _TAG_RE = re.compile(r'<[^>]+>')
+
+# Raw, unnamed PropertyID — absent from pyOneNote's `_property_id_name_mapping`
+# (decodes as "Unknown", which `get_properties()` silently drops; see
+# `_patches._get_properties`'s `'body'` field, kept exactly so callers that
+# know a raw ID can still read it, same pattern `ink.py` already uses for
+# undocumented ink properties). Empirically verified against a real merged
+# table (three merges: two text rows, one image cell) by dumping every raw
+# property ID on every `jcidTableCellNode` and diffing merged vs. unmerged
+# cells: absent on every ordinary cell; on a merge, the FIRST (content-
+# bearing) cell carries the merge's total column span as a plain 4-byte int
+# (2, for every merge in the test file — no 3+-column merge was available to
+# confirm higher spans), and each ABSORBED cell after it carries 0. OneNote's
+# own MHT export confirms the expected shape (`<td colspan="2">`) for the
+# same rows. Not a content-equality heuristic (the kind already rejected
+# elsewhere in this codebase, see known-limitations.md) — a genuine
+# structural signal, independent of what text happens to be in the cell.
+_PRID_TABLE_CELL_MERGE_SPAN = 0x140035DD
+_MAX_PLAUSIBLE_MERGE_SPAN = 20
+
+
+def _cell_merge_span(cell_prop) -> Optional[int]:
+    """None (no signal / not a merge), 0 (this cell is absorbed by the
+    preceding cell's span — caller must skip it), or the >=1 column count
+    the FIRST cell of a merge should render as `colspan`."""
+    body = (cell_prop or {}).get('body') if cell_prop else None
+    if body is None:
+        return None
+    for prid, data in zip(getattr(body, 'rgPrids', ()), getattr(body, 'rgData', ())):
+        if prid.value == _PRID_TABLE_CELL_MERGE_SPAN and isinstance(data, (bytes, bytearray)) and len(data) == 4:
+            span = int.from_bytes(data, 'little')
+            return span if span <= _MAX_PLAUSIBLE_MERGE_SPAN else None
+    return None
+
+
+# TableColumnWidths ([MS-ONESTORE] 0x1C001D66) is a variable-length blob
+# (byte 0 = column count, followed by that many little-endian float32
+# values, one per column) — `PropertySet.get_properties()`'s generic
+# fallback for this property TYPE (any variable-length blob whose bytes
+# don't happen to decode as UTF-16) is `.hex()`, which loses the structure;
+# worse, a short/unlucky byte pattern occasionally DOES decode as UTF-16
+# (observed on the sibling property `TableColumnsLocked` — same blob shape,
+# came back as mojibake instead of a hex string), so parsing `val`'s string
+# form isn't reliable either way. Read the raw bytes directly instead (same
+# `body` escape hatch `_cell_merge_span` and `ink.py` already use for
+# properties `get_properties()` mangles or drops). Each float is in the same
+# "half-inch units" convention pyOneNote's own `half_inch_size_to_pixels`
+# already applies to every other width/height property in this codebase
+# (dpi=96 assumed, matching that function) — verified against a real 8-column
+# table: decoded widths (in px) were [49.5, 117.4, 80.7, 85.4, 91.9, 49.5,
+# 50.4, 49.5] for columns ID/Name/Department/City/"Join Date"/Salary/Status/
+# (blank) — narrow for short fields (ID/Salary/Status), wide for Name and the
+# date column, exactly as the real table looks.
+_PRID_TABLE_COLUMN_WIDTHS = 0x1C001D66
+_MAX_PLAUSIBLE_TABLE_COLUMNS = 100
+
+
+def _table_column_widths_px(table_prop) -> Optional[list]:
+    body = (table_prop or {}).get('body') if table_prop else None
+    if body is None:
+        return None
+    for prid, data in zip(getattr(body, 'rgPrids', ()), getattr(body, 'rgData', ())):
+        if prid.value != _PRID_TABLE_COLUMN_WIDTHS:
+            continue
+        raw = getattr(data, 'Data', None)
+        if not raw:
+            return None
+        count = raw[0]
+        if not 0 < count <= _MAX_PLAUSIBLE_TABLE_COLUMNS or len(raw) < 1 + count * 4:
+            return None
+        floats = struct.unpack(f'<{count}f', raw[1:1 + count * 4])
+        return [round(f * 48, 1) for f in floats]  # half-inch -> px @96dpi
+    return None
+
+
+def _table_borders_visible(table_prop) -> Optional[bool]:
+    """True/False (OneNote's show/hide-borders table toggle), or None when
+    the property isn't present (an unstyled table — treat as the default,
+    visible)."""
+    val = (table_prop or {}).get('val', {}) if table_prop else {}
+    v = val.get('TableBordersVisible')
+    return None if v is None else str(v).lower() == 'true'
 
 
 def _has_visible_content(html_str: str) -> bool:
@@ -386,13 +468,24 @@ def _child_ids(prop) -> list:
     return [x for x in out if x]
 
 
-def _collect_cell_runs(nid, by_id, consumed, list_runs, depth=0, seen=None) -> list:
+def _collect_cell_runs(nid, by_id, consumed, list_runs, image_builder, images, depth=0, seen=None) -> list:
     """Recursively collect a table cell's own text runs from the object tree,
     each resolved the SAME way a page's body runs are (formatting, paragraph
     alignment, list membership) — same run-dict shape `_runs_to_paragraphs`
     already renders, reused here instead of the cell getting its own
     stripped-down bare-text rendering. Records consumed run identities so
-    they aren't also re-emitted as loose page paragraphs."""
+    they aren't also re-emitted as loose page paragraphs.
+
+    A `jcidImageNode` found in the same subtree is extracted via
+    `image_builder` (an `identity, val -> PageImage | None` callable the
+    caller supplies — this module has no direct access to
+    `files_by_identity` — `identity` lets the caller dedupe against the
+    SAME image also being found by its own top-level scan) and appended to
+    `images` (a mutable accumulator, same pattern as `consumed`) rather than
+    mixed into the returned run list — images render after the cell's text,
+    not interleaved at their exact original position (a simplification: the
+    one real test cell with an image had no other
+    content to interleave with)."""
     seen = seen if seen is not None else set()
     if depth > 8 or not nid or nid in seen:
         return []
@@ -400,7 +493,8 @@ def _collect_cell_runs(nid, by_id, consumed, list_runs, depth=0, seen=None) -> l
     prop = by_id.get(nid)
     if not prop:
         return []
-    if prop.get('type') == 'jcidRichTextOENode':
+    ptype = prop.get('type')
+    if ptype == 'jcidRichTextOENode':
         consumed.add(nid)
         val = prop.get('val', {})
         rtu = val.get('RichEditTextUnicode')
@@ -426,30 +520,59 @@ def _collect_cell_runs(nid, by_id, consumed, list_runs, depth=0, seen=None) -> l
         if fmt is not None:
             entry['fmt'] = fmt
         return [entry]
+    if ptype == 'jcidImageNode' and image_builder is not None:
+        image = image_builder(nid, prop.get('val', {}))
+        if image is not None:
+            images.append(image)
+        return []
     runs = []
     for cid in _child_ids(prop):
-        runs.extend(_collect_cell_runs(cid, by_id, consumed, list_runs, depth + 1, seen))
+        runs.extend(_collect_cell_runs(cid, by_id, consumed, list_runs, image_builder, images, depth + 1, seen))
     return runs
 
 
-def _resolve_cell_html(nid, by_id, consumed, list_runs=None) -> str:
+def _resolve_cell_html(nid, by_id, consumed, list_runs=None, image_builder=None, images=None) -> str:
     """Render one table cell's full content — same formatting/alignment/list
-    rendering as a page's own body text. Returns already block-wrapped HTML
-    (one or more `<p>`/`<ul>`/`<ol>` elements via `_runs_to_paragraphs`), or
-    `''` for a genuinely empty cell — `_table_html` uses the result as-is,
-    it does not add its own `<p>` wrapper."""
-    runs = _collect_cell_runs(nid, by_id, consumed, list_runs or {})
-    return _runs_to_paragraphs(runs) if runs else ''
+    rendering as a page's own body text, plus any image(s) pasted directly
+    into the cell (see `_collect_cell_runs`; `images`, if given, gets any
+    found appended to it — same mutable-accumulator pattern as `consumed`,
+    used by the caller to total up a whole table's images, e.g. for
+    `page.images`). Returns already block-wrapped HTML (one or more
+    `<p>`/`<ul>`/`<ol>`/`<img>` elements), or `''` for a genuinely empty
+    cell — `_table_html` uses the result as-is, it does not add its own
+    `<p>` wrapper."""
+    # Deliberately a fresh list, NOT `images` itself — `images` is shared
+    # across every cell in the table (so the caller gets the table's full
+    # total), but rendering THIS cell's own <img> tags from that shared
+    # list would leak in images found in EARLIER cells of the same table.
+    # Real bug, verified against a real 3-cell row: cell 3 (no image of its
+    # own) rendered cell 2's image a second time because both looped over
+    # the same already-shared accumulator.
+    local_images = []
+    runs = _collect_cell_runs(nid, by_id, consumed, list_runs or {}, image_builder, local_images)
+    html = _runs_to_paragraphs(runs) if runs else ''
+    for image in local_images:
+        html += _image_block_html(image.ref)
+    if images is not None:
+        images.extend(local_images)
+    return html
 
 
-def _resolve_table_grid(table_prop, by_id, consumed, list_runs=None) -> list:
+def _resolve_table_grid(table_prop, by_id, consumed, list_runs=None, image_builder=None, images=None) -> list:
     """Walk table -> rows -> cells -> content into a 2D grid of
-    `{'html', 'color'}` dicts (`color` from `CellShadingColor`, `#rrggbb` or
-    `None` for an unshaded cell — same 4-byte RGB+alpha-flag shape as
-    `FontColor`/`Highlight`, reusing `_color_from_bytes`).
+    `{'html', 'color', 'colspan'}` dicts (`color` from `CellShadingColor`,
+    `#rrggbb` or `None` for an unshaded cell — same 4-byte RGB+alpha-flag
+    shape as `FontColor`/`Highlight`, reusing `_color_from_bytes`; `colspan`
+    from `_cell_merge_span`, always >= 1). A cell absorbed by a preceding
+    merge (`_cell_merge_span` == 0) is dropped from its row entirely — the
+    preceding cell's `colspan` already accounts for the grid columns it
+    covers. Any images found inside a cell (see `_resolve_cell_html`) are
+    appended to `images`.
 
     Relies on the patched object-stream read so references resolve distinctly.
     """
+    if images is None:
+        images = []
     grid = []
     for rid in _child_ids(table_prop):
         row = by_id.get(rid)
@@ -458,21 +581,47 @@ def _resolve_table_grid(table_prop, by_id, consumed, list_runs=None) -> list:
         cells = []
         for cid in _child_ids(row):
             cell_prop = by_id.get(cid)
+            span = _cell_merge_span(cell_prop)
+            if span == 0:
+                continue
             color = _color_from_bytes((cell_prop.get('val', {}) if cell_prop else {}).get('CellShadingColor'))
-            cells.append({'html': _resolve_cell_html(cid, by_id, consumed, list_runs), 'color': color})
+            html = _resolve_cell_html(cid, by_id, consumed, list_runs, image_builder, images)
+            cells.append({'html': html, 'color': color, 'colspan': span or 1})
         grid.append(cells)
     return grid
 
 
-def _table_html(grid: list) -> str:
-    """grid is rows of `{'html', 'color'}` dicts (see `_resolve_table_grid`)
-    -> a `<table>` fragment. `html` is used as-is (already block-wrapped);
-    `color`, if set, becomes the cell's `background-color`."""
+def _table_html(grid: list, table_prop=None) -> str:
+    """grid is rows of `{'html', 'color', 'colspan'}` dicts (see
+    `_resolve_table_grid`) -> a `<table>` fragment. `html` is used as-is
+    (already block-wrapped); `color`, if set, becomes the cell's
+    `background-color`; `colspan`, if > 1, becomes the `colspan` attribute.
+
+    `table_prop` (the table's own decoded property dict, `by_id[tid]` —
+    optional, and only useful when it carries the raw `body` `_resolve_table_grid`
+    doesn't need) adds table-level styling on top: `TableColumnWidths` as a
+    `<colgroup>` (an HTML table's default column sizing is content-driven and
+    ignores OneNote's own widths entirely without this), `TableBordersVisible`
+    as a real border only when explicitly ON (an HTML `<table>` has no border
+    by default, matching a OneNote table with borders explicitly hidden — no
+    styling needed for that half; the visible-borders half is the one that
+    needs explicit CSS)."""
+    borders_visible = _table_borders_visible(table_prop)
+    widths = _table_column_widths_px(table_prop)
+    colgroup = ('<colgroup>' + ''.join(f'<col style="width:{w}px">' for w in widths) + '</colgroup>') if widths else ''
+    table_attrs = ' style="border-collapse:collapse"' if borders_visible else ''
     rows_html = []
     for row in grid:
         cells = []
         for cell in row:
-            style = f' style="background-color:{cell["color"]}"' if cell.get('color') else ''
-            cells.append(f'<td{style}>{cell.get("html") or "<p></p>"}</td>')
+            styles = []
+            if borders_visible:
+                styles.append('border:1px solid #999')
+            if cell.get('color'):
+                styles.append(f'background-color:{cell["color"]}')
+            attrs = f' style="{";".join(styles)}"' if styles else ''
+            if cell.get('colspan', 1) > 1:
+                attrs += f' colspan="{cell["colspan"]}"'
+            cells.append(f'<td{attrs}>{cell.get("html") or "<p></p>"}</td>')
         rows_html.append(f'<tr>{"".join(cells)}</tr>')
-    return f'<table>{"".join(rows_html)}</table>'
+    return f'<table{table_attrs}>{colgroup}{"".join(rows_html)}</table>'

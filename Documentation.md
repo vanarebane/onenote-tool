@@ -421,7 +421,7 @@ Legend: ✅ complete and verified · ⚠️ partial / best-effort · ❌ not imp
 |---|:---:|:---:|
 | Plain text / paragraphs | ✅ | ✅ |
 | Headings (h1–h3) | ✅ | ⚠️ (only when the underlying style object decodes) |
-| Bold / italic / underline / strikethrough | ✅ | ⚠️ (same — per-run, not guaranteed) |
+| Bold / italic / underline / strikethrough | ✅ (real pyOneNote bug fixed: every `True`-valued boolean property, project-wide, was being silently dropped — see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) | ⚠️ (same — per-run, not guaranteed) |
 | Font color / highlight | ✅ | ⚠️ (same) |
 | Font size / family | ✅ (only where the run explicitly overrides the paragraph default — see below) | ⚠️ (same per-run decode ceiling as other formatting) |
 | Bulleted / numbered lists, incl. nesting | ✅ | ⚠️ (wired in; verified partial on a real file — ~47% of the objects needed for list membership and ~25% for ordered-vs-bullet decoded) |
@@ -431,9 +431,9 @@ Legend: ✅ complete and verified · ⚠️ partial / best-effort · ❌ not imp
 | Audio recordings | ✅ (inline `<audio>` player) | ✅ (verified against real .wav/.ogg attachments — extension classification, not page attribution, is what's proven here; a file can still land on the wrong page under the pre-existing structural-clustering spillover) |
 | Video attachments | ✅ (inline `<video>` player) | ✅ (same — verified against real .mp4/.webm/.wmv attachments) |
 | Tables | ✅ (correct cell placement; cells render with the same formatting/alignment/lists/background-color as body text — see below) | ❌ (wired in, but every `jcidTableNode` in the test file decoded to a completely empty property set — 0/6 across both protected sections tested; see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) |
-| Merged table cells | ❌ (no merge/span signal found anywhere in the readable property set, despite real content demonstrating it — see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) | ❌ |
-| Images inside a table cell | ❌ (not yet implemented — see below) | ❌ |
-| Table-level styling (column widths, border visibility, autofit) | ❌ (real properties found, not yet exposed — no field for this in `blocks` today) | ❌ |
+| Merged table cells | ✅ (a real, undocumented-by-pyOneNote structural property found via raw property scanning — not a content heuristic; renders as real `<td colspan>`, matching the MHT ground truth — see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) | ❌ |
+| Images inside a table cell | ✅ (verified against a real cell; two real bugs — double-extraction and a cross-cell image leak — found and fixed along the way, see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) | ❌ (protected tables never decode at all — see above) |
+| Table-level styling (column widths, border visibility) | ✅ (baked into the table's own HTML as a `<colgroup>` + border styling, same inline-CSS convention as cell color/alignment; "autofit vs. fixed width" needs no separate handling — both just resolve to concrete column widths — see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) | ❌ |
 | Ink / hand-drawn drawings | ✅ | ⚠️ (collected structurally; stroke decode has the same partial-decode ceiling) |
 | YouTube embeds (thumbnail-matched) | ✅ | ⚠️ (embed itself wired in and renders correctly; thumbnail pre-matching not attempted; unverified against real decoded data — see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) |
 | Paragraph text alignment (left/center/right) | ✅ | ⚠️ (same per-run decode ceiling as other formatting) |
@@ -464,19 +464,23 @@ confirm what byte it uses, so an unrecognized value is left unstyled
 
 A table cell's own content gets exactly the same treatment as page body
 text — bold/italic/underline/strike/color/highlight/font-size/font-family,
-paragraph alignment, and bulleted/numbered lists all render inside a cell
-the same way they would outside one. A cell's own background
+paragraph alignment, bulleted/numbered lists, and a pasted-in image all
+render inside a cell the same way they would outside one (an image's bytes
+still go through `page.images` like any other image — the same
+placeholder-token/`ref` contract, just referenced from inside the cell's
+own `html` instead of a top-level `image` block). A cell's own background
 (`CellShadingColor`) becomes `style="background-color:..."` on the `<td>`
-itself. **Not currently handled**: merged cells (OneNote's own renderer
-resolves these to real `colspan`, but no merge/span signal was found
-anywhere in the property set this tool can read — see
+itself. Merged cells resolve to a real `colspan` on the surviving `<td>`
+(the absorbed cell is dropped) — a genuine structural property found by
+scanning every raw property ID on a real merged cell rather than one this
+tool could look up by name (see
 [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)
-— so a merged cell's content currently appears duplicated across the
-separate cells it spans, rather than collapsed into one), images pasted
-directly into a cell, and table-level styling (column widths, border
-visibility, "autofit" vs. fixed width) — real properties exist for all of
-these (`TableColumnWidths`, `TableBordersVisible`, `TableColumnsLocked`)
-but nothing in the `blocks` schema exposes them yet.
+for how it was found). Table-level styling — column widths and
+border-visibility — is baked into the table's own `<table>`/`<colgroup>`
+markup, the same additive-inline-CSS approach as everything above; no new
+`blocks` schema field was needed for any of this. `TableColumnsLocked`
+(an editing-lock bitmask, not visible content) is deliberately not exposed
+— see known limitations for why.
 
 ### Table B — OneNote versions tested against
 

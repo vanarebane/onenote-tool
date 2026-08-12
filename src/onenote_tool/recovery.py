@@ -496,8 +496,8 @@ def _pages_from_structural_groups(document, by_id: dict, groups: list) -> list:
             continue
 
         blocks = []
-        for _tid, grid in d['tables']:
-            blocks.append({'kind': 'table', 'html': _table_html(grid)})
+        for tid, grid in d['tables']:
+            blocks.append({'kind': 'table', 'html': _table_html(grid, by_id.get(tid))})
         if d['runs']:
             blocks.append({'kind': 'text', 'html': _runs_to_paragraphs(d['runs'])})
         for image in images:

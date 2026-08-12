@@ -5,6 +5,7 @@ a caller already extracted from a property dict.
 """
 from __future__ import annotations
 
+import codecs
 import re
 from typing import Optional
 
@@ -66,13 +67,21 @@ def _extract_guid(value) -> str:
 
 
 def _as_bytes(value) -> bytes:
-    """pyOneNote hands raw fixed-width props back as a bytes-repr string (b'\\x03\\x00')."""
+    """pyOneNote hands raw fixed-width props back as a bytes-repr string (b'\\x03\\x00').
+
+    Decoded with `codecs.escape_decode` (the same escape-sequence parser
+    CPython itself uses for a bytes literal) rather than `ast.literal_eval` —
+    ~375x faster on real samples, verified byte-identical output. Went from
+    a cheap, rarely-called helper to a real hot path once per-cell
+    formatting (font-size/color/alignment) started resolving every table
+    cell's own runs — `ast.literal_eval`'s full compile()+AST-parse
+    machinery for what's really just an escape-sequence decode became
+    measurable (real file: 21s for a 396KB section, mostly `compile()`)."""
     try:
-        import ast
         if isinstance(value, (bytes, bytearray)):
             return bytes(value)
-        if isinstance(value, str) and value.startswith("b'"):
-            return bytes(ast.literal_eval(value))
+        if isinstance(value, str) and value.startswith("b'") and value.endswith("'"):
+            return codecs.escape_decode(value[2:-1].encode('latin1'))[0]
     except Exception:
         pass
     return b''
