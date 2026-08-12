@@ -21,11 +21,14 @@ from typing import Optional
 
 from . import ink as onenote_ink
 from ._patches import OneDocment, _pyonenote_filenode
-from .images import _FILE_PLACEHOLDER, _IMAGE_EXTS, _IMAGE_PLACEHOLDER, _MAX_IMAGE_DISPLAY_WIDTH, _attachment_kind
+from .images import (
+    _FILE_PLACEHOLDER, _IMAGE_EXTS, _IMAGE_PLACEHOLDER, _MAX_IMAGE_DISPLAY_WIDTH, _attachment_kind,
+    _youtube_from_rtu,
+)
 from .models import PageFile, PageImage, PageResult
 from .rendering import (
-    _RTU_MARKER, _child_ids, _image_block_html, _list_is_ordered, _media_block_html, _resolve_run_format,
-    _resolve_table_grid, _rtu_to_inline_html, _runs_to_paragraphs, _table_html,
+    _child_ids, _image_block_html, _list_is_ordered, _media_block_html, _paragraph_alignment,
+    _resolve_run_format, _resolve_table_grid, _rtu_to_inline_html, _runs_to_paragraphs, _table_html,
 )
 from .stamps import classify_stamp
 from .text import _clean_text, _le_int, _norm_identity, decode_run_text
@@ -236,18 +239,68 @@ def _pages_from_structural_groups(document, by_id: dict, groups: list) -> list:
             return _clean_text(decode_run_text(t)) or t.strip()
         return None
 
+    _MAX_PLAUSIBLE_PAGE_LEVEL = 20  # OneNote UI caps nesting well under this
+
+    def _page_sub_level(identity):
+        """OneNote PageLevel (1/2/3 = top/sub/sub-sub) -> sub_level (0/1/2),
+        same field and same off-by-one as `parser.parse_one_file`'s main
+        pipeline reads from the identical `jcidPageMetaData` property — just
+        via `by_id` (shadow-decrypted) instead of the raw `props` list.
+        Defaults to 0 (top-level) when the property didn't decode, same
+        default the main pipeline falls back to.
+
+        Clamped: verified on a real protected file that `PageLevel` can
+        decode to outright garbage (a misaligned property landing on
+        unrelated ciphertext) rather than just failing cleanly — one page
+        came back as `PageLevel=3334854043`, which without a plausibility
+        cap would have produced an equally nonsensical `sub_level`. The
+        normal (unprotected) pipeline doesn't need this same guard: its
+        PropertySet decode doesn't hit misaligned reads the way protected
+        content's 3-attempt chain does, so garbage values like this haven't
+        been observed there."""
+        val = (by_id.get(identity) or {}).get('val', {})
+        level = _le_int(val.get('PageLevel'), 1)
+        if not 1 <= level <= _MAX_PLAUSIBLE_PAGE_LEVEL:
+            level = 1
+        return max(0, level - 1)
+
     def _run_entry(identity):
         """Mirrors the normal per-page pipeline's TEXT_TYPES branch closely
         enough to reuse its renderer, `_runs_to_paragraphs` — same run-dict
-        shape ({'t','h','fmt','list'}), so formatting (bold/italic/color/
-        highlight/headings, resolved via `_resolve_run_format` against the
-        same shadow-decrypted `by_id`) and list membership render instead of
-        being silently dropped as plain text."""
+        shape ({'t','h','fmt','list','yt'}), so formatting (bold/italic/
+        color/highlight/headings, resolved via `_resolve_run_format` against
+        the same shadow-decrypted `by_id`), list membership, and a standalone
+        YouTube link render instead of being silently dropped as plain text
+        or a bare `<a>`.
+
+        The YouTube case is wired the same way as everything else here —
+        reusing `images._youtube_from_rtu`, the SAME detector the normal
+        pipeline uses, against the same shadow-decrypted `RichEditTextUnicode`
+        — but unlike lists/alignment/tables above, it's NOT verified against
+        a real decoded example: the one real YouTube link in the test file
+        used for this never decoded at all (`RichEditTextUnicode` came back
+        empty), same ordinary partial-decode ceiling as everything else, not
+        a new failure mode. Deliberately does NOT attempt the normal
+        pipeline's thumbnail-perceptual-hash matching
+        (`_youtube_thumb_hashes`/`images._build_page_image`'s `dhash`) —
+        `_pages_from_structural_groups`'s own `PageImage`s don't compute a
+        `dhash` at all, and matching one to the right embed here would be
+        new, unverified logic on top of already-unverified input; the embed
+        still renders correctly without a matched thumbnail, just falling
+        back to YouTube's own thumbnail client-side (see
+        `rendering._youtube_embed_html`)."""
         val = (by_id.get(identity) or {}).get('val', {})
         raw = val.get('TextExtendedAscii')
         rtu = val.get('RichEditTextUnicode')
+        # See parser.py's identical fix — RichEditTextUnicode is used
+        # whenever present, not just when it carries a hyperlink; a run's
+        # plain (non-hyperlink) text can live there too when it needs real
+        # Unicode TextExtendedAscii can't hold (e.g. a currency symbol).
         inline_html = None
-        if isinstance(rtu, str) and _RTU_MARKER in rtu:
+        if isinstance(rtu, str) and rtu.replace('\x00', '').strip():
+            yt = _youtube_from_rtu(rtu)
+            if yt is not None:
+                return {'t': yt['title'] or yt['url'], 'h': None, 'yt': yt}
             text, inline_html = _rtu_to_inline_html(rtu)
         elif raw is not None:
             text = _clean_text(decode_run_text(raw))
@@ -258,6 +311,9 @@ def _pages_from_structural_groups(document, by_id: dict, groups: list) -> list:
         entry = {'t': text, 'h': inline_html}
         if identity in list_runs:
             entry['list'] = list_runs[identity]
+        align = _paragraph_alignment(val.get('ParagraphAlignment'))
+        if align:
+            entry['align'] = align
         fmt = _resolve_run_format(val.get('ParagraphStyle'), val.get('TextRunFormatting'), by_id)
         if fmt is not None:
             entry['fmt'] = fmt
@@ -291,6 +347,7 @@ def _pages_from_structural_groups(document, by_id: dict, groups: list) -> list:
         else:
             untitled_counter[0] += 1
             title = f'Untitled page {untitled_counter[0]}' if untitled_counter[0] > 1 else 'Untitled page'
+        sub_level = _page_sub_level(grp['title_identity'])
 
         # Tables first: `_resolve_table_grid` walks each table's own row/cell
         # tree through the SAME shadow-decrypted `by_id` the normal per-page
@@ -307,7 +364,7 @@ def _pages_from_structural_groups(document, by_id: dict, groups: list) -> list:
             table_prop = by_id.get(tid)
             if not table_prop:
                 continue
-            grid = _resolve_table_grid(table_prop, by_id, table_consumed)
+            grid = _resolve_table_grid(table_prop, by_id, table_consumed, list_runs)
             if grid:
                 grids.append((tid, grid))
 
@@ -326,6 +383,7 @@ def _pages_from_structural_groups(document, by_id: dict, groups: list) -> list:
         decoded.append({
             'title_identity': grp['title_identity'], 'title': title, 'has_real_title': bool(real_title),
             'runs': runs, 'file_guids': file_guids, 'ink_identities': ink_identities, 'tables': grids,
+            'sub_level': sub_level,
         })
 
     # PHASE 2: revision duplication produces more than one group for the SAME
@@ -462,6 +520,7 @@ def _pages_from_structural_groups(document, by_id: dict, groups: list) -> list:
         results.append((d['title_identity'], PageResult(
             title=d['title'][:100], blocks=blocks, block_count=len(blocks),
             images=images, files=attachments + [pf for _k, pf in media],
+            sub_level=d['sub_level'],
         )))
 
     # A DIFFERENT revision-duplication shape: the exact SAME title identity

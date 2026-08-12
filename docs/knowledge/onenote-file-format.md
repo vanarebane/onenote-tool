@@ -86,7 +86,113 @@ even though `ParagraphStyle.FontSize` was present on all four regardless.
 `ParagraphStyle`'s copy too would wrap every paragraph in a same-as-default
 span.
 
-### Embedded files and images — two different node shapes
+### Paragraph alignment lives on the run itself, not a style object
+
+`ParagraphAlignment` — unlike every other formatting property in this
+doc — is a single raw byte read directly off the `jcidRichTextOENode`
+run's own property set, not off its referenced `ParagraphStyle` or
+`TextRunFormatting` object. Confirmed against a real file with four
+alignments demonstrated: a "center-middle" labelled box carried `b'\x01'`,
+two "right corner" boxes both carried `b'\x02'`, and every left-aligned
+box (the common/default case) had no `ParagraphAlignment` property at all
+— same "only written when it differs from the default" pattern as
+`TextRunFormatting.FontSize` above, just on a different object. No `0` or
+`3` (presumably justify) value has been observed yet, so
+`rendering._paragraph_alignment` only maps `1`→`center`/`2`→`right` and
+leaves anything else unmapped rather than guessing.
+
+### A run's text lives in EITHER TextExtendedAscii OR RichEditTextUnicode, never both
+
+Verified directly on a real file (checked every `jcidRichTextOENode` in a
+section): 0 runs ever had both `TextExtendedAscii` and `RichEditTextUnicode`
+set — it's strictly either/or, not a fallback pair. `RichEditTextUnicode`
+isn't exclusively for hyperlink fields either, despite every example
+elsewhere in this doc involving one: a run's PLAIN text (no `HYPERLINK`
+marker at all) lands there instead of `TextExtendedAscii` whenever it needs
+a character `TextExtendedAscii` can't represent — confirmed with a real
+table column of currency values ("13911€") where every cell's content was
+`RichEditTextUnicode`-only, `TextExtendedAscii` genuinely absent (`None`).
+
+**Real bug this caused, fixed in three call sites** (`parser.parse_one_file`,
+`rendering._resolve_cell_html`, `recovery._pages_from_structural_groups`'s
+`_run_entry`): all three used to gate reading `RichEditTextUnicode` at all
+on it containing the hyperlink marker (`_RTU_MARKER`) — a run whose RTU had
+real plain text but no marker fell through to `TextExtendedAscii`, found it
+`None`, and produced empty text, silently dropping the run's entire content.
+`rendering._rtu_to_inline_html` already handled the no-marker case
+correctly (it just returns the plain text, linkified) — the bug was purely
+in the callers' gating condition, not the decoder itself. Fixed by checking
+"is RichEditTextUnicode present and non-empty" instead of "does it contain
+the hyperlink marker" — `_youtube_from_rtu`/`_rtu_to_inline_html` still
+correctly fall through to plain-text handling on their own when no marker
+is present, so nothing needed to change downstream of that check.
+
+### ISO-format dates are real content, not a OneNote auto-stamp
+
+`stamps.classify_stamp` used to also match bare `YYYY-MM-DD` as a page
+date/time auto-stamp (meant to strip OneNote's own auto-inserted "created"
+line from body text). **Real false positive, verified against a real
+file**: a data table's "Join Date" column (genuine typed content, e.g.
+"2021-01-15") was silently dropped from every row — matched as a stamp,
+which classifies it as metadata rather than cell text. Every REAL OneNote
+auto-stamp actually observed (see `stamps.py`'s own docstring examples)
+uses a written month name ("19. juuli 2014", "April 08, 2025", ...) — never
+ISO format. The ISO-matching branch appears to have been added
+speculatively, without a real example ever confirming OneNote writes stamps
+that way. Removed; an ISO-format real auto-stamp, if one ever turns up,
+would just render as an ordinary paragraph instead of setting `created_at`
+— a far cheaper failure mode than silently eating real content.
+
+### Table cell styling properties
+
+Found in pyOneNote's property table, confirmed against a real richly-styled
+test table:
+
+- `CellShadingColor` — a cell's own background, the SAME 4-byte RGB+
+  alpha-flag shape as `FontColor`/`Highlight` elsewhere in this doc (alpha
+  `0x00` = explicit color) — `rendering._color_from_bytes` already handled
+  this shape, no new decoder needed.
+- `ParagraphAlignment` — read directly off a cell's own text runs, exactly
+  the same property (and same object — the run itself, not `ParagraphStyle`
+  or `TableCellNode`) as the page-body alignment finding above. Cell-level
+  and body-paragraph alignment are the same mechanism, not a separate one.
+- `TableColumnWidths`, `TableBordersVisible`, `TableColumnsLocked` — live on
+  the `jcidTableNode` itself (table-wide, not per-cell/-row). Not yet
+  exposed anywhere in this tool's output — no field for table-level styling
+  exists in the `blocks` schema today. `TableColumnsLocked`'s value shape
+  wasn't fully decoded (came back as what looks like a 2-byte flag,
+  `TableBordersVisible` as a plain `'True'`/`'False'` string) — connecting
+  these to the "autofit columns" / "show/hide borders" UI toggles they
+  correspond to hasn't been verified against multiple real examples of each
+  state.
+- **No merge/span property found anywhere** — checked every property on
+  `jcidTableNode`/`jcidTableRowNode`/`jcidTableCellNode` this tool can read.
+  A merged cell's content is stored as plain duplication instead (two
+  separate `jcidRichTextOENode` objects, different identities, identical
+  text, one in each cell the merge visually spans) — OneNote's own MHT
+  export resolves this to a real `<td colspan=2>`, so genuine merge
+  information exists somewhere, just not anywhere pyOneNote's property
+  table exposes it. See
+  [known-limitations.md](known-limitations.md) for why a content-equality
+  heuristic wasn't used to approximate it.
+
+### A ground-truth source worth knowing about: OneNote's own MHT export
+
+OneNote's "Export → Single File Web Page (.mht)" produces a real,
+Microsoft-authored rendering of a notebook as literal HTML+CSS — page
+titles at `font-size:20pt;font-family:'Calibri Light'`, each floating box
+as a `<div style='margin-top:...;margin-left:...;width:...'>` (inches,
+not this tool's internal units, but the same position concept `page.regions`
+exposes), real `<table>` markup, inline `font-size`/`font-family`/`color`/
+`text-align` CSS matching this tool's own mappings almost field-for-field.
+Both real bugs on this page were found by decoding a `.mht` file (a
+standard MIME `multipart/related` document — Python's stdlib `email`
+module parses it directly, no special tooling needed) and diffing its
+actual rendered content against this tool's own output for the same
+notebook — a full-text word-level diff surfaced both false-negatives (this
+tool dropping content the MHT export has) almost immediately. A much
+stronger verification signal than eyeballing block kinds/counts, since it's
+Microsoft's own tooling asserting what the "correct" answer is.
 
 An embedded file's actual bytes are reachable two different ways, and a
 real notebook uses **both**, sometimes for the same logical file:
@@ -249,3 +355,21 @@ pairs matching its visual layout exactly); using `text._le_int` on them
 caught before landing by cross-checking the parsed output against the
 manual property dump. `ordering._page_regions` has its own small `_int`
 coercion for this reason — see `models.PageRegion`.
+
+**A page's multiple outline boxes share the SAME base guid as each other
+and as the page itself** — the general MS-ONESTORE rule ("objects in one
+object space share a base guid," used correctly elsewhere in this codebase
+for ink containers and page grouping) doesn't mean "one guid per object,"
+it means "one guid per PAGE, shared by every object in it, distinguished
+only by the small revision counter." Verified directly on a real 6-box
+page: all 6 `jcidOutlineNode`s' identities were `{page_base_guid},N` for 6
+different `N`, not 6 different base guids. A first version of
+`ordering._page_regions` keyed each region by `identity.split(',')[0]`
+(correct for page-level lookups, where there's only ever one object needing
+that key per page) and silently collapsed all 6 boxes onto one identical
+key as a result — caught by checking actual per-region *content* against
+the real page, not just that the right number of `(x, y)` pairs came back.
+Fixed by keying on the outline node's full `(base, revision)` identity
+instead. General lesson: base-guid truncation is only safe for something
+that is genuinely singular per page (the page's own metadata/title/manifest)
+— anything that can occur more than once per page needs the full identity.

@@ -5,8 +5,10 @@ from onenote_tool.rendering import (
     _image_block_html,
     _linkify,
     _media_block_html,
+    _paragraph_alignment,
     _placeholder_blocks,
     _render_list,
+    _resolve_cell_html,
     _resolve_run_format,
     _runs_to_paragraphs,
     _table_html,
@@ -82,6 +84,27 @@ def test_media_block_html_audio_and_video():
     assert _media_block_html('video', 'onenote-file://2') == '<video controls src="onenote-file://2"></video>'
 
 
+def test_paragraph_alignment_center_and_right():
+    assert _paragraph_alignment(b'\x01') == 'center'
+    assert _paragraph_alignment(b'\x02') == 'right'
+
+
+def test_paragraph_alignment_absent_or_unknown_is_none():
+    assert _paragraph_alignment(None) is None
+    assert _paragraph_alignment(b'\x00') is None  # left is the unwritten default
+    assert _paragraph_alignment(b'\x09') is None  # unrecognized byte -> not guessed at
+
+
+def test_runs_to_paragraphs_applies_alignment():
+    runs = [{'t': 'Righty', 'h': None, 'align': 'right'}]
+    assert _runs_to_paragraphs(runs) == '<p style="text-align:right">Righty</p>'
+
+
+def test_runs_to_paragraphs_no_alignment_is_plain_p():
+    runs = [{'t': 'Lefty', 'h': None}]
+    assert _runs_to_paragraphs(runs) == '<p>Lefty</p>'
+
+
 def test_linkify_wraps_bare_url():
     out = _linkify('see https://example.com/path for details')
     assert '<a href="https://example.com/path">https://example.com/path</a>' in out
@@ -145,9 +168,26 @@ def test_render_list_nested_level():
 
 
 def test_table_html_basic_grid():
-    grid = [['a', 'b'], ['c', 'd']]
+    # Cells are already block-wrapped HTML (see _resolve_table_grid) — _table_html
+    # uses them as-is, it doesn't add its own <p>.
+    grid = [
+        [{'html': '<p>a</p>', 'color': None}, {'html': '<p>b</p>', 'color': None}],
+        [{'html': '<p>c</p>', 'color': None}, {'html': '<p>d</p>', 'color': None}],
+    ]
     out = _table_html(grid)
     assert out == '<table><tr><td><p>a</p></td><td><p>b</p></td></tr><tr><td><p>c</p></td><td><p>d</p></td></tr></table>'
+
+
+def test_table_html_cell_background_color():
+    grid = [[{'html': '<p>a</p>', 'color': '#e2efd9'}]]
+    out = _table_html(grid)
+    assert out == '<table><tr><td style="background-color:#e2efd9"><p>a</p></td></tr></table>'
+
+
+def test_table_html_empty_cell_falls_back_to_empty_paragraph():
+    grid = [[{'html': '', 'color': None}]]
+    out = _table_html(grid)
+    assert out == '<table><tr><td><p></p></td></tr></table>'
 
 
 def test_has_visible_content_with_text():
@@ -174,3 +214,51 @@ def test_placeholder_blocks_shape():
     assert 'a hand-drawn ink drawing' in blocks[0]['html']
     assert 'could not be decoded' in blocks[0]['html']
     assert 'x' not in blocks[0] and 'y' not in blocks[0]
+
+
+def test_resolve_cell_html_non_hyperlink_unicode_text():
+    # Real bug, verified against a real file: a table cell whose text needed
+    # a character TextExtendedAscii can't hold (a currency symbol) stored it
+    # in RichEditTextUnicode with NO hyperlink marker at all, and
+    # TextExtendedAscii was genuinely absent (None) — this used to require
+    # the hyperlink marker to even look at RichEditTextUnicode, silently
+    # dropping the cell's entire content.
+    by_id = {
+        'cell,1': {'type': 'jcidRichTextOENode', 'val': {'RichEditTextUnicode': '13911€\x00'}},
+    }
+    consumed = set()
+    assert _resolve_cell_html('cell,1', by_id, consumed) == '<p>13911€</p>'
+    assert 'cell,1' in consumed
+
+
+def test_resolve_cell_html_still_handles_real_hyperlinks():
+    rtu = '﷟HYPERLINK "https://example.com"Example'
+    by_id = {'cell,1': {'type': 'jcidRichTextOENode', 'val': {'RichEditTextUnicode': rtu}}}
+    out = _resolve_cell_html('cell,1', by_id, set())
+    assert '<a href="https://example.com">Example</a>' in out
+
+
+def test_resolve_cell_html_applies_formatting_and_alignment():
+    # Real bug fixed: cells used to get bare linkified text only — no bold/
+    # color/font-size/alignment/list support at all, unlike body paragraphs.
+    guid = '33333333-3333-3333-3333-333333333333'
+    by_id = {
+        f'{guid},1': {
+            'type': 'jcidRichTextOENode',
+            'val': {
+                'TextExtendedAscii': '4d65726765642063656c6c',  # "Merged cell"
+                'ParagraphAlignment': b'\x01',
+                'TextRunFormatting': [f'<ExtendedGUID> ({guid}, 2)'],
+            },
+        },
+        f'{guid},2': {'val': {'Bold': 'True'}},
+    }
+    out = _resolve_cell_html(f'{guid},1', by_id, set())
+    assert out == '<p style="text-align:center"><strong>Merged cell</strong></p>'
+
+
+def test_resolve_cell_html_renders_a_list():
+    guid = '44444444-4444-4444-4444-444444444444'
+    by_id = {f'{guid},1': {'type': 'jcidRichTextOENode', 'val': {'TextExtendedAscii': '4f6e65'}}}  # "One"
+    out = _resolve_cell_html(f'{guid},1', by_id, set(), list_runs={f'{guid},1': {'ordered': False, 'level': 0}})
+    assert out == '<ul><li><p>One</p></li></ul>'

@@ -178,11 +178,16 @@ def _page_regions(props, by_id):
     here.
 
     Returns `(regions_by_page{page_guid: [{'guid','x','y','width','height'}, ...]}`
-    in page order, `content_region{content_identity: region_guid})`. A page
-    whose structure doesn't resolve this way (e.g. a still-encrypted
-    protected section, where these child-reference properties don't decode
-    at all) simply contributes no entries — same "additive, silently absent
-    when it can't be built" shape as the rest of this module.
+    in page order, `content_region{content_identity: region_guid})`. `guid`
+    here is each outline node's own FULL `(base, revision)` identity, not
+    just its base guid — multiple outline boxes on one page normally share
+    the SAME base guid (they're all objects in that one page's object-space,
+    distinguished only by revision counter), so the base guid alone can't
+    tell two boxes apart. A page whose structure doesn't resolve this way
+    (e.g. a still-encrypted protected section, where these child-reference
+    properties don't decode at all) simply contributes no entries — same
+    "additive, silently absent when it can't be built" shape as the rest of
+    this module.
     """
     regions_by_page = {}
     content_region = {}
@@ -229,7 +234,15 @@ def _page_regions(props, by_id):
                 if not onode or onode.get('type') != 'jcidOutlineNode':
                     continue
                 ov = onode.get('val', {})
-                region_guid = (onid or '').split(',')[0]
+                # The FULL identity, not the base guid: every object inside
+                # one page's object-space (title, outlines, runs, ...)
+                # normally shares that SAME base guid, differing only by
+                # revision counter — real bug found using base-guid-only
+                # here, verified against a real 6-box page: all 6 outline
+                # nodes collapsed onto one identical `region_guid`, so every
+                # region ended up rendering the SAME merged content instead
+                # of its own box's.
+                region_guid = onid
                 if not region_guid:
                     continue
                 region_list.append({

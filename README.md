@@ -11,6 +11,12 @@ undocumented, and this tool reads what it can, reports what it can't, and
 never claims perfect fidelity. See [Documentation.md](https://github.com/vanarebane/onenote-tool/blob/main/Documentation.md) for
 exactly what's currently supported.
 
+Scope note: a `.onepkg` export never contains recycle-bin content — a
+deleted page or a whole deleted section leaves no trace in the file at all,
+confirmed directly (not a decode gap this tool could close). Nothing here
+recovers deleted OneNote content; it only converts what's actually in the
+export you give it.
+
 ## What it's for
 
 - Pulling text, images, audio/video, tables, hyperlinks, ink/drawings, and

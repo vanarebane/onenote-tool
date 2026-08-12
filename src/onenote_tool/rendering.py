@@ -76,6 +76,26 @@ def _heading_level(style_id) -> Optional[int]:
     return None
 
 
+# ParagraphAlignment is a single byte living directly on the run's own
+# property set (NOT via ParagraphStyle/TextRunFormatting like every other
+# formatting field in this module) — OneNote only ever writes it when a
+# paragraph is explicitly set to something other than left, confirmed
+# against a real file: a "center-middle" labelled box carried `b'\x01'`, two
+# "right corner" boxes carried `b'\x02'`, and every left-aligned box (the
+# implicit default) had no `ParagraphAlignment` property at all. Only 1/2
+# have been observed; a 'justify' value likely exists but hasn't been seen,
+# so an unrecognized byte is deliberately left unmapped (None) rather than
+# guessed at.
+_PARAGRAPH_ALIGNMENT = {1: 'center', 2: 'right'}
+
+
+def _paragraph_alignment(value) -> Optional[str]:
+    b = _as_bytes(value)
+    if not b:
+        return None
+    return _PARAGRAPH_ALIGNMENT.get(b[0])
+
+
 def _font_size_pt(value) -> Optional[float]:
     """OneNote's FontSize prop is 2 bytes, little-endian, in HALF-POINTS
     (verified against a real file: a run labelled "X Large 36" carried the
@@ -300,9 +320,13 @@ def _render_list(items: list) -> str:
     return ''.join(out)
 
 
+def _align_attr(align: Optional[str]) -> str:
+    return f' style="text-align:{align}"' if align else ''
+
+
 def _runs_to_paragraphs(runs: list) -> str:
     """Each run is a dict {'t': plain text, 'h': inline html or None, 'yt': ...,
-    'list': {'ordered', 'level'} or absent}."""
+    'list': {'ordered', 'level'} or absent, 'align': 'center'|'right' or absent}."""
     parts = []
     pending = []  # consecutive list items -> one <ul>/<ol>
 
@@ -332,17 +356,18 @@ def _runs_to_paragraphs(runs: list) -> str:
             continue
         fmt = run.get('fmt')
         inner = _apply_marks(inner, fmt)
+        align = _align_attr(run.get('align'))
         li = run.get('list')
         if li:
-            pending.append({'ordered': li['ordered'], 'level': li['level'], 'html': f'<p>{inner}</p>'})
+            pending.append({'ordered': li['ordered'], 'level': li['level'], 'html': f'<p{align}>{inner}</p>'})
             continue
         flush()
         level = fmt.get('heading') if fmt else None
         if level:
             tag = f'h{min(level, 3)}'  # h1..h3 only, matching common editor support
-            parts.append(f'<{tag}>{inner}</{tag}>')
+            parts.append(f'<{tag}{align}>{inner}</{tag}>')
         else:
-            parts.append(f'<p>{inner}</p>')
+            parts.append(f'<p{align}>{inner}</p>')
     flush()
     return ''.join(parts) or '<p></p>'
 
@@ -361,39 +386,67 @@ def _child_ids(prop) -> list:
     return [x for x in out if x]
 
 
-def _resolve_cell_html(nid, by_id, consumed, depth=0, seen=None) -> str:
-    """Recursively render a table cell's content (text + links) from the object
-    tree, recording the run identities consumed so they aren't re-emitted."""
+def _collect_cell_runs(nid, by_id, consumed, list_runs, depth=0, seen=None) -> list:
+    """Recursively collect a table cell's own text runs from the object tree,
+    each resolved the SAME way a page's body runs are (formatting, paragraph
+    alignment, list membership) — same run-dict shape `_runs_to_paragraphs`
+    already renders, reused here instead of the cell getting its own
+    stripped-down bare-text rendering. Records consumed run identities so
+    they aren't also re-emitted as loose page paragraphs."""
     seen = seen if seen is not None else set()
     if depth > 8 or not nid or nid in seen:
-        return ''
+        return []
     seen.add(nid)
     prop = by_id.get(nid)
     if not prop:
-        return ''
-    parts = []
+        return []
     if prop.get('type') == 'jcidRichTextOENode':
         consumed.add(nid)
         val = prop.get('val', {})
         rtu = val.get('RichEditTextUnicode')
-        if isinstance(rtu, str) and _RTU_MARKER in rtu:
-            _, inline = _rtu_to_inline_html(rtu)
-            if inline:
-                parts.append(inline)
+        # See parser.py's identical fix for why RichEditTextUnicode is used
+        # whenever present, not just when it carries a hyperlink — a cell's
+        # plain (non-hyperlink) text can live there too when it needs real
+        # Unicode (e.g. a currency symbol TextExtendedAscii can't hold).
+        if isinstance(rtu, str) and rtu.replace('\x00', '').strip():
+            text, inline_html = _rtu_to_inline_html(rtu)
         else:
             raw = val.get('TextExtendedAscii')
+            inline_html = None
             text = _clean_text(decode_run_text(raw)) if raw is not None else ''
-            if text and not _is_stamp(text):
-                parts.append(_linkify(text))
+        if not text or _is_stamp(text):
+            return []
+        entry = {'t': text, 'h': inline_html}
+        if nid in list_runs:
+            entry['list'] = list_runs[nid]
+        align = _paragraph_alignment(val.get('ParagraphAlignment'))
+        if align:
+            entry['align'] = align
+        fmt = _resolve_run_format(val.get('ParagraphStyle'), val.get('TextRunFormatting'), by_id)
+        if fmt is not None:
+            entry['fmt'] = fmt
+        return [entry]
+    runs = []
     for cid in _child_ids(prop):
-        child = _resolve_cell_html(cid, by_id, consumed, depth + 1, seen)
-        if child:
-            parts.append(child)
-    return ' '.join(parts)
+        runs.extend(_collect_cell_runs(cid, by_id, consumed, list_runs, depth + 1, seen))
+    return runs
 
 
-def _resolve_table_grid(table_prop, by_id, consumed) -> list:
-    """Walk table -> rows -> cells -> content into a 2D grid of cell HTML.
+def _resolve_cell_html(nid, by_id, consumed, list_runs=None) -> str:
+    """Render one table cell's full content — same formatting/alignment/list
+    rendering as a page's own body text. Returns already block-wrapped HTML
+    (one or more `<p>`/`<ul>`/`<ol>` elements via `_runs_to_paragraphs`), or
+    `''` for a genuinely empty cell — `_table_html` uses the result as-is,
+    it does not add its own `<p>` wrapper."""
+    runs = _collect_cell_runs(nid, by_id, consumed, list_runs or {})
+    return _runs_to_paragraphs(runs) if runs else ''
+
+
+def _resolve_table_grid(table_prop, by_id, consumed, list_runs=None) -> list:
+    """Walk table -> rows -> cells -> content into a 2D grid of
+    `{'html', 'color'}` dicts (`color` from `CellShadingColor`, `#rrggbb` or
+    `None` for an unshaded cell — same 4-byte RGB+alpha-flag shape as
+    `FontColor`/`Highlight`, reusing `_color_from_bytes`).
 
     Relies on the patched object-stream read so references resolve distinctly.
     """
@@ -402,14 +455,24 @@ def _resolve_table_grid(table_prop, by_id, consumed) -> list:
         row = by_id.get(rid)
         if not row or row.get('type') != 'jcidTableRowNode':
             continue
-        grid.append([_resolve_cell_html(cid, by_id, consumed) for cid in _child_ids(row)])
+        cells = []
+        for cid in _child_ids(row):
+            cell_prop = by_id.get(cid)
+            color = _color_from_bytes((cell_prop.get('val', {}) if cell_prop else {}).get('CellShadingColor'))
+            cells.append({'html': _resolve_cell_html(cid, by_id, consumed, list_runs), 'color': color})
+        grid.append(cells)
     return grid
 
 
 def _table_html(grid: list) -> str:
-    """grid is rows of inline-HTML strings (or None) -> a <table> fragment."""
+    """grid is rows of `{'html', 'color'}` dicts (see `_resolve_table_grid`)
+    -> a `<table>` fragment. `html` is used as-is (already block-wrapped);
+    `color`, if set, becomes the cell's `background-color`."""
     rows_html = []
     for row in grid:
-        cells = ''.join(f'<td><p>{cell or ""}</p></td>' for cell in row)
-        rows_html.append(f'<tr>{cells}</tr>')
+        cells = []
+        for cell in row:
+            style = f' style="background-color:{cell["color"]}"' if cell.get('color') else ''
+            cells.append(f'<td{style}>{cell.get("html") or "<p></p>"}</td>')
+        rows_html.append(f'<tr>{"".join(cells)}</tr>')
     return f'<table>{"".join(rows_html)}</table>'

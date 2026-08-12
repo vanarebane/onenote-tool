@@ -21,10 +21,12 @@ def test_month_name_day_comma_year():
     assert value == datetime(2025, 4, 8, 0, 0)
 
 
-def test_iso_date():
-    kind, value = classify_stamp('2025-04-08')
-    assert kind == 'datetime'
-    assert value == datetime(2025, 4, 8)
+def test_iso_date_is_not_a_stamp():
+    # No real OneNote auto-stamp has ever been observed in ISO format (every
+    # real example uses a written month name) — verified as a real false
+    # positive against a real file: a table's "Join Date" column full of ISO
+    # dates was silently dropped because this used to match.
+    assert classify_stamp('2025-04-08') == (None, None)
 
 
 def test_bare_time():

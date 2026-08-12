@@ -28,8 +28,8 @@ from .ordering import _object_space_order, _page_content_order, _page_regions
 from .recovery import _flat_recover_protected_pages
 from .rendering import (
     _RTU_MARKER, _child_ids, _has_visible_content, _image_block_html, _list_is_ordered, _media_block_html,
-    _placeholder_blocks, _placeholder_run, _placeholder_text, _resolve_run_format, _resolve_table_grid,
-    _runs_to_paragraphs, _rtu_to_inline_html, _table_html,
+    _paragraph_alignment, _placeholder_blocks, _placeholder_run, _placeholder_text, _resolve_run_format,
+    _resolve_table_grid, _runs_to_paragraphs, _rtu_to_inline_html, _table_html,
 )
 from .stamps import _is_stamp, classify_stamp
 from .text import _clean_text, _clean_title, _extract_guid, _le_int, _norm_identity, decode_run_text
@@ -348,11 +348,21 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
             grp = group_for(current_guid)
             raw = val.get('TextExtendedAscii')
             rtu = val.get('RichEditTextUnicode')
-            # A run's links live in RichEditTextUnicode (HYPERLINK fields); the
-            # plain text lives in TextExtendedAscii. Use the linkified version
-            # when the run carries a hyperlink, otherwise the plain text.
+            # A run's real text lives in EITHER field, never both (verified
+            # on a real file: 0 runs had both TextExtendedAscii and
+            # RichEditTextUnicode set) — TextExtendedAscii for plain
+            # ASCII-representable text, RichEditTextUnicode for anything
+            # needing real Unicode: a hyperlink field, but ALSO plain text
+            # containing a character TextExtendedAscii can't hold (e.g. a
+            # currency symbol). Real bug found and fixed here: this used to
+            # only look at RichEditTextUnicode when it contained the
+            # hyperlink marker, so a plain (non-hyperlink) Unicode-only run
+            # fell through to TextExtendedAscii, found it genuinely absent
+            # (None), and silently produced no text at all — confirmed
+            # against a real table whose "Salary" column ("13911€" etc., a
+            # euro sign) was entirely dropped this way.
             inline_html = None
-            if isinstance(rtu, str) and _RTU_MARKER in rtu:
+            if isinstance(rtu, str) and rtu.replace('\x00', '').strip():
                 yt = _youtube_from_rtu(rtu)
                 if yt is not None:
                     if not any(r.get('yt', {}).get('videoId') == yt['videoId'] for r in grp['runs']):
@@ -360,7 +370,8 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
                     report.ok('youtube')
                     continue
                 text, inline_html = _rtu_to_inline_html(rtu)
-                report.ok('link_run')
+                if _RTU_MARKER in rtu:
+                    report.ok('link_run')
             else:
                 text = _clean_text(decode_run_text(raw)) if raw is not None else ''
             if not text:
@@ -402,6 +413,9 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
             run_entry = {'t': text, 'h': inline_html, 'rid': run_id}
             if run_id in list_runs:
                 run_entry['list'] = list_runs[run_id]
+            align = _paragraph_alignment(val.get('ParagraphAlignment'))
+            if align:
+                run_entry['align'] = align
             fmt = _resolve_run_format(val.get('ParagraphStyle'), val.get('TextRunFormatting'), by_id)
             if fmt is not None:
                 run_entry['fmt'] = fmt
@@ -475,7 +489,7 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
                 if tid is None or tid not in seen_tables:
                     if tid is not None:
                         seen_tables.add(tid)
-                    grid = _resolve_table_grid(prop, by_id, grp.setdefault('table_consumed', set()))
+                    grid = _resolve_table_grid(prop, by_id, grp.setdefault('table_consumed', set()), list_runs)
                     if grid:
                         grp.setdefault('tables', []).append((tid, grid))
             report.ok('table')

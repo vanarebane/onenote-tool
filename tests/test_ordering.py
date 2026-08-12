@@ -66,17 +66,70 @@ def test_page_regions_two_floating_boxes():
 
     regions = regions_by_page[PAGE_GUID]
     assert len(regions) == 2
-    assert regions[0]['guid'] == OUTLINE1_GUID
+    assert regions[0]['guid'] == f'{OUTLINE1_GUID},30'
     assert regions[0]['x'] == 10 and regions[0]['y'] == 20
     assert regions[0]['width'] == 100 and regions[0]['height'] == 50
-    assert regions[1]['guid'] == OUTLINE2_GUID
+    assert regions[1]['guid'] == f'{OUTLINE2_GUID},40'
     assert regions[1]['x'] == 200
 
-    assert content_region[f'{RUN1_GUID},31'] == OUTLINE1_GUID
-    assert content_region[f'{RUN2_GUID},41'] == OUTLINE2_GUID
+    assert content_region[f'{RUN1_GUID},31'] == f'{OUTLINE1_GUID},30'
+    assert content_region[f'{RUN2_GUID},41'] == f'{OUTLINE2_GUID},40'
 
 
 def test_page_regions_no_manifest_returns_empty():
     regions_by_page, content_region = _page_regions([], {})
     assert regions_by_page == {}
     assert content_region == {}
+
+
+def test_page_regions_outlines_sharing_the_page_base_guid_stay_distinct():
+    # Real bug, verified against a real 6-box page: every object inside one
+    # page's object-space (title, outlines, runs, ...) normally shares that
+    # SAME base guid, differing only by revision counter — using base-guid-
+    # only as the region key collapsed all 6 outline boxes onto one
+    # identical key, so every region rendered the SAME merged content
+    # instead of its own. This synthetic case reuses PAGE_GUID as BOTH
+    # outlines' own base guid (the realistic shape) to guard against that
+    # regressing.
+    props = [
+        {
+            'type': 'jcidPageManifestNode',
+            'identity': _ident(PAGE_GUID, 10),
+            'val': {'ContentChildNodesOfPageManifest': _ident(PAGE_GUID, 20)},
+        },
+        {
+            'type': 'jcidPageNode',
+            'identity': _ident(PAGE_GUID, 20),
+            'val': {'ElementChildNodesOfVersionHistory': [
+                *_ident(PAGE_GUID, 30), *_ident(PAGE_GUID, 40),
+            ]},
+        },
+        {
+            'type': 'jcidOutlineNode',
+            'identity': _ident(PAGE_GUID, 30),
+            'val': {
+                'OffsetFromParentHoriz': 10, 'OffsetFromParentVert': 20,
+                'ElementChildNodesOfVersionHistory': _ident(PAGE_GUID, 31),
+            },
+        },
+        {'type': 'jcidRichTextOENode', 'identity': _ident(PAGE_GUID, 31), 'val': {}},
+        {
+            'type': 'jcidOutlineNode',
+            'identity': _ident(PAGE_GUID, 40),
+            'val': {
+                'OffsetFromParentHoriz': 200, 'OffsetFromParentVert': 20,
+                'ElementChildNodesOfVersionHistory': _ident(PAGE_GUID, 41),
+            },
+        },
+        {'type': 'jcidRichTextOENode', 'identity': _ident(PAGE_GUID, 41), 'val': {}},
+    ]
+    by_id = {}
+    for p in props:
+        by_id[f"{p['identity'][0].split('(')[1].split(')')[0].replace(' ', '')}"] = p
+
+    regions_by_page, content_region = _page_regions(props, by_id)
+    regions = regions_by_page[PAGE_GUID]
+    assert len(regions) == 2
+    assert regions[0]['guid'] != regions[1]['guid']
+    assert content_region[f'{PAGE_GUID},31'] == regions[0]['guid']
+    assert content_region[f'{PAGE_GUID},41'] == regions[1]['guid']

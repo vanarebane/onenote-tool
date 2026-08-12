@@ -29,7 +29,18 @@ _TIME_RE = re.compile(r'(\d{1,2}):(\d{2})(?::\d{2})?\s*$')
 
 
 def _parse_date_core(core: str):
-    """core has weekday/time removed; return (year, month, day) or None."""
+    """core has weekday/time removed; return (year, month, day) or None.
+
+    Deliberately does NOT match bare ISO `YYYY-MM-DD` (a prior version did) —
+    every real OneNote auto-stamp actually observed uses a written month name
+    ("19. juuli 2014", "April 08, 2025", ...), never ISO. Verified as a real
+    false positive against a real file: a data table's "Join Date" column
+    (genuine user content, e.g. "2021-01-15") was silently dropped from every
+    row because it matched this pattern and got classified as a page
+    timestamp instead of cell text. An ISO-format real auto-stamp, if one
+    ever turns up, would just render as an ordinary paragraph instead of
+    setting `created_at` — a far cheaper failure than silently eating real
+    content."""
     core = core.strip().rstrip(',').strip()
     m = re.match(r'^(\d{1,2})\.?\s+([^\d\s.,]+)\.?\s+(\d{4})$', core)  # DD. month YYYY
     if m:
@@ -41,9 +52,6 @@ def _parse_date_core(core: str):
         mon = _MONTHS.get(m.group(1).lower())
         if mon:
             return int(m.group(3)), mon, int(m.group(2))
-    m = re.match(r'^(\d{4})-(\d{1,2})-(\d{1,2})$', core)              # ISO
-    if m:
-        return int(m.group(1)), int(m.group(2)), int(m.group(3))
     return None
 
 

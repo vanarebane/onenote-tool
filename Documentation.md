@@ -428,17 +428,21 @@ Legend: ✅ complete and verified · ⚠️ partial / best-effort · ❌ not imp
 | Hyperlinks (standalone + inline) | ✅ | ⚠️ (mechanism is wired in, same per-run decode ceiling as formatting) |
 | Images (inline/pasted) | ✅ | ✅ |
 | Embedded files / attachments (non-image) | ✅ | ✅ |
-| Audio recordings | ✅ (inline `<audio>` player) | ✅ (same) |
-| Video attachments | ✅ (inline `<video>` player) | ✅ (same) |
-| Tables | ✅ (correct cell placement) | ❌ (wired in, but every `jcidTableNode` in the test file decoded to a completely empty property set — 0/6 across both protected sections tested; see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) |
+| Audio recordings | ✅ (inline `<audio>` player) | ✅ (verified against real .wav/.ogg attachments — extension classification, not page attribution, is what's proven here; a file can still land on the wrong page under the pre-existing structural-clustering spillover) |
+| Video attachments | ✅ (inline `<video>` player) | ✅ (same — verified against real .mp4/.webm/.wmv attachments) |
+| Tables | ✅ (correct cell placement; cells render with the same formatting/alignment/lists/background-color as body text — see below) | ❌ (wired in, but every `jcidTableNode` in the test file decoded to a completely empty property set — 0/6 across both protected sections tested; see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) |
+| Merged table cells | ❌ (no merge/span signal found anywhere in the readable property set, despite real content demonstrating it — see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) | ❌ |
+| Images inside a table cell | ❌ (not yet implemented — see below) | ❌ |
+| Table-level styling (column widths, border visibility, autofit) | ❌ (real properties found, not yet exposed — no field for this in `blocks` today) | ❌ |
 | Ink / hand-drawn drawings | ✅ | ⚠️ (collected structurally; stroke decode has the same partial-decode ceiling) |
-| YouTube embeds (thumbnail-matched) | ✅ | ❌ |
-| Floating-box canvas layout (`page.regions`) | ✅ (position/size per top-level content box) | ❌ (not implemented for protected-content recovery) |
+| YouTube embeds (thumbnail-matched) | ✅ | ⚠️ (embed itself wired in and renders correctly; thumbnail pre-matching not attempted; unverified against real decoded data — see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) |
+| Paragraph text alignment (left/center/right) | ✅ | ⚠️ (same per-run decode ceiling as other formatting) |
+| Floating-box canvas layout (`page.regions`) | ✅ (position/size per top-level content box, verified against a real 6-box page) | ❌ (tried directly against a real protected copy of that same 6-box page — the 5-level reference chain needed never decoded intact for even one page; see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) |
 | Page titles | ✅ | ⚠️ (commonly ~50–100% depending on the file; some titles are never recoverable at all) |
 | Page order within a section | ✅ | ⚠️ (structural file-position order used as a proxy, not verified against OneNote's own page-series order) |
 | Section groups / folders | ✅ | ✅ (comes from the `.onepkg` archive structure, unaffected by a section's own encryption) |
 | Date/time auto-stamps → page `created_at` | ✅ | ✅ |
-| Page indent level (sub-pages) | ✅ | ❌ (protected-content recovery doesn't set this; always 0) |
+| Page indent level (sub-pages) | ✅ | ⚠️ (reads the same `PageLevel` property as the normal pipeline; verified recovering a real secondary-level page — bounded by the usual per-object decode ceiling, so a page whose own `PageMetaData` didn't decode still defaults to top-level) |
 | Revision-duplicate cleanup (no ghost/duplicate pages) | ✅ | ⚠️ (actively handled with a dedicated dedup pass; some spillover cases are documented, not all eliminated) |
 
 Font size/family is deliberately **not** mapped from `ParagraphStyle` (the
@@ -448,6 +452,31 @@ own `TextRunFormatting` override, matching what OneNote itself actually writes
 from the paragraph's default). Mapping the always-present paragraph default
 too would wrap every single paragraph in a same-as-default `font-size`/
 `font-family` span for no visible difference.
+
+Paragraph alignment maps to a `style="text-align:..."` attribute on the
+paragraph's own `<p>`/`<h#>`/list-item tag (not a nested `<span>`, since
+alignment is a paragraph-level property, not a per-character one). Only
+`center` and `right` are currently recognized — OneNote only writes
+`ParagraphAlignment` at all when a paragraph isn't left-aligned (its
+unwritten default), and no real `justify` value has been observed yet to
+confirm what byte it uses, so an unrecognized value is left unstyled
+(effectively left-aligned) rather than guessed at.
+
+A table cell's own content gets exactly the same treatment as page body
+text — bold/italic/underline/strike/color/highlight/font-size/font-family,
+paragraph alignment, and bulleted/numbered lists all render inside a cell
+the same way they would outside one. A cell's own background
+(`CellShadingColor`) becomes `style="background-color:..."` on the `<td>`
+itself. **Not currently handled**: merged cells (OneNote's own renderer
+resolves these to real `colspan`, but no merge/span signal was found
+anywhere in the property set this tool can read — see
+[known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)
+— so a merged cell's content currently appears duplicated across the
+separate cells it spans, rather than collapsed into one), images pasted
+directly into a cell, and table-level styling (column widths, border
+visibility, "autofit" vs. fixed width) — real properties exist for all of
+these (`TableColumnWidths`, `TableBordersVisible`, `TableColumnsLocked`)
+but nothing in the `blocks` schema exposes them yet.
 
 ### Table B — OneNote versions tested against
 
