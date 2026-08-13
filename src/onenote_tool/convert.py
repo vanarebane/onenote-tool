@@ -22,6 +22,32 @@ from .rendering import _placeholder_blocks
 log = logging.getLogger(__name__)
 
 
+def _fix_mojibake(name: str) -> str:
+    """Undo a real, verified CAB-extraction bug: a non-ASCII section/group
+    name (Estonian ö/ü, etc.) can come back from `expand.exe`/`cabextract`
+    double-encoded — its real UTF-8 bytes decoded as Latin-1 first, then
+    re-encoded as UTF-8 — the classic "Ã¶" for "ö" mojibake shape.
+    Confirmed on a real notebook: "Hommikusöögiks" extracted as
+    "HommikusÃ¶Ã¶giks". `expand.exe`/`cabextract` are external tools this
+    package doesn't control, so fix the DISPLAY name after the fact rather
+    than the file on disk.
+
+    Round-trip through Latin-1 and back is the correction (encode as
+    Latin-1 to recover the original raw bytes, decode as UTF-8 to get the
+    real text) and doubles as its own safety check: it only succeeds for a
+    string that's ACTUALLY this exact mojibake shape. A name with no
+    non-ASCII characters round-trips back to itself unchanged (harmless
+    no-op). A name with genuine, correctly-encoded Unicode (e.g. "Meie
+    Maja™") fails at the very first step — Latin-1 can't represent U+2122
+    at all — so it's left alone rather than mangled further; same for any
+    other already-correct non-ASCII name outside Latin-1's range.
+    """
+    try:
+        return name.encode('latin-1').decode('utf-8')
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return name
+
+
 def _find_expand_exe() -> Optional[str]:
     candidate = os.path.join(os.environ.get('WINDIR', r'C:\Windows'), 'System32', 'expand.exe')
     if os.path.exists(candidate):
@@ -145,11 +171,11 @@ def process_sections(
     passwords_seen = list(dict.fromkeys(p for p in (section_passwords or {}).values() if p))
 
     for i, one_path in enumerate(one_files):
-        section_name = os.path.splitext(os.path.basename(one_path))[0]
+        section_name = _fix_mojibake(os.path.splitext(os.path.basename(one_path))[0])
         # Subfolders in the .onepkg are OneNote section groups; the relative
         # directory path from the notebook root is the group hierarchy.
         rel_dir = os.path.relpath(os.path.dirname(one_path), work_dir)
-        group_path = [] if rel_dir in ('.', '') else rel_dir.split(os.sep)
+        group_path = [] if rel_dir in ('.', '') else [_fix_mojibake(p) for p in rel_dir.split(os.sep)]
         explicit = (section_passwords or {}).get(section_name)
         candidates = list(dict.fromkeys(([explicit] if explicit else []) + passwords_seen))
 
@@ -211,7 +237,7 @@ def convert_onepkg(
         try:
             progress_cb('start', {
                 'sections': [
-                    {'name': os.path.splitext(os.path.basename(p))[0], 'size': sizes[p]}
+                    {'name': _fix_mojibake(os.path.splitext(os.path.basename(p))[0]), 'size': sizes[p]}
                     for p in one_files
                 ],
                 'total_size': total_size,

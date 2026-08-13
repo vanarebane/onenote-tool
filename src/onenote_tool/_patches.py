@@ -240,6 +240,70 @@ try:  # pyOneNote is a required dependency at parse time, but importing
         # survives even when OIDs-stream resolution (every OTHER correlation
         # this package tries) is completely unavailable.
         self._structural_start = file.tell()
+
+        # pyOneNote bug, found and fixed on a real ~20MB section from a
+        # real, large, multi-author shared notebook: file_node_id 0 and 255
+        # are BOTH end-of-fragment terminator markers — pyOneNote's OWN
+        # `FileNodeListFragment.__init__` loop already checks for exactly
+        # this (`if ... file_node_id == 255 or ... == 0: break`,
+        # FileNode.py) — but that check only runs AFTER unconditionally
+        # constructing a full FileNode for the terminator first, and that
+        # construction can itself crash before the loop ever gets a chance
+        # to recognize it: id 0 isn't in pyOneNote's own `_FileNodeIDs`
+        # table at all, so it falls into the generic `else: pass`
+        # (unhandled type) branch, leaving `self.data` unset — then the
+        # SAME `__init__` unconditionally does `self.data.ref` for any node
+        # whose header bits happen to decode `baseType == 2` (confirmed:
+        # true for a real id-0 terminator's header value), crashing with
+        # `AttributeError` before the caller's loop-terminator check is
+        # ever reached. Confirmed on the real file: this happened 93%
+        # through a 19MB section — losing the parse this deep discards
+        # nearly all of that section's real content for what both
+        # pyOneNote's own loop AND [MS-ONESTORE] agree is just a normal,
+        # expected end-of-fragment marker, not a genuinely unsupported
+        # type. Peek the header first (4 bytes, exactly what
+        # `FileNodeHeader.__init__` itself reads — nothing to rewind, the
+        # enclosing fragment loop seeks to an absolute offset right after
+        # breaking regardless of where this leaves the cursor) and treat a
+        # terminator ID as one immediately — no data, no children, matching
+        # the "no data part" shape pyOneNote's own dispatch already uses
+        # for other structural end-markers — instead of running the
+        # crash-prone vendor dispatch for it at all.
+        header = _pyonenote_filenode.FileNodeHeader(file)
+        if header.file_node_id in (0, 255):
+            self.document = document
+            self.file_node_header = header
+            self.children = []
+            self.data = None
+            return
+        if header.file_node_id not in _pyonenote_filenode.FileNodeHeader._FileNodeIDs and header.baseType == 2:
+            # A DIFFERENT unhandled-type crash, found on the same real
+            # notebook, one directory over: file_node_id 2 — not a
+            # terminator (only 0/255 are), genuinely absent from
+            # pyOneNote's own `_FileNodeIDs` table, so it falls into the
+            # same crash-prone "no data assigned, but baseType==2 still
+            # tries `self.data.ref`" gap above. Tried reading a generic
+            # FileNodeChunkReference here first (the same structural field
+            # every OTHER baseType==2 node has, working for a different
+            # unhandled type in `_encryption_key_fnd_fix` below) and
+            # recursing into its children the way pyOneNote's own dispatch
+            # would have — but on the real file this decoded a garbage stp
+            # offset (`ValueError: cannot fit 'int' into an offset-sized
+            # integer`), meaning this ID's real byte layout isn't a plain
+            # chunk reference at all (or this is genuinely corrupted data,
+            # not a rare-but-valid type). Recursing into that would risk
+            # building on garbage rather than just losing this one node's
+            # subtree — the same "no data, no children" fallback as the
+            # terminator case above is the safer choice here: it caps the
+            # damage to whatever's structurally beneath this ONE anomalous
+            # node, instead of either crashing the whole section or
+            # potentially misreading further content from a bad offset.
+            self.document = document
+            self.file_node_header = header
+            self.children = []
+            self.data = None
+            return
+        file.seek(self._structural_start)
         _orig_filenode_init(self, file, document)
         _encryption_key_fnd_fix(self, file, document)
         if _active_marker_probe[0]:
@@ -380,6 +444,36 @@ try:  # pyOneNote is a required dependency at parse time, but importing
         return out
 
     OneDocment.files_by_identity = _files_by_identity
+
+    # pyOneNote bug fix: `get_json()` calls `.hex()` unconditionally on
+    # every `get_files()` entry's `content` — but an
+    # `ObjectDeclarationFileData3RefCountFND` declaration with no matching
+    # `FileDataStoreObjectReferenceFND` (the blob genuinely never showed up
+    # anywhere in the file — a real, legitimate state for a heavily-pruned
+    # revision history, confirmed on a real, large, multi-author shared
+    # notebook: 6 of its sections hit this) leaves that entry's `content`
+    # at `get_files()`'s own string default (`""`), and `"".hex()` raises
+    # `AttributeError: 'str' object has no attribute 'hex'` — aborting the
+    # ENTIRE section's parse (`parse_one_file` calls `get_json()`
+    # unconditionally) for one incomplete, usually-irrelevant file
+    # declaration. Guard the same way get_json() itself should have:
+    # `.hex()` only when content is real bytes, `''` otherwise.
+    def _safe_get_json(self):
+        files_in_hex = {}
+        for key, file_entry in (self.get_files() or {}).items():
+            content = file_entry.get('content')
+            files_in_hex[key] = {
+                'extension': file_entry.get('extension', ''),
+                'content': content.hex() if isinstance(content, (bytes, bytearray)) else '',
+                'identity': file_entry.get('identity', ''),
+            }
+        return {
+            'headers': self.header.convert_to_dictionary(),
+            'properties': self.get_properties(),
+            'files': files_in_hex,
+        }
+
+    OneDocment.get_json = _safe_get_json
 
     # pyOneNote raises NotImplementedError on property type 0x10 (ArrayOfPropertyValues)
     # mid-way through reading an object's property set, which aborts the ENTIRE .one

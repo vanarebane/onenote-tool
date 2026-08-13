@@ -49,6 +49,111 @@ genuinely-cosmetic embedded-file preview misses (the real attached file
 itself already succeeded and shows up as a download link — no placeholder
 needed, nothing lost).
 
+## Real crashes, found and fixed testing a large, real, multi-author shared notebook
+
+A second real-world stress test (a ~220MB, 61-section notebook synced
+between two users — a genuinely different shape of complexity than a
+single-author notebook: more revision generations, more concurrent-edit
+history) surfaced **8 of 61 sections failing to parse at all**
+(`section_parse_error:AttributeError`) — each one caught gracefully by
+`convert.py`'s per-section try/except (so the OTHER 53 sections still
+converted fine, and the process itself never crashed), but an entire
+section's worth of real pages reduced to a single error placeholder each
+time. Two distinct root causes, both real bugs in pyOneNote itself, not in
+this package's own logic:
+
+**1. `FileNode.__init__` crashes on its own fragment-terminator marker.**
+pyOneNote's `FileNodeListFragment.__init__` loop already checks for
+`file_node_id == 0` or `255` as an end-of-fragment terminator (`FileNode
+.py`, `if ... file_node_id == 255 or ... == 0: break`) — but that check
+only runs AFTER unconditionally constructing a full `FileNode` for
+whatever comes next, including the terminator itself. `file_node_id 0`
+isn't in pyOneNote's own `_FileNodeIDs` table at all, so constructing it
+falls into the generic "unhandled type" branch (`self.data` never gets
+assigned) — and the SAME `__init__` unconditionally does `self.data.ref`
+for any node whose header bits decode `baseType == 2` (confirmed true for
+a real id-0 terminator's actual header value), crashing with
+`AttributeError: 'FileNode' object has no attribute 'data'` before the
+loop's own terminator check is ever reached. Confirmed on the real file:
+this happened **93% through a 19MB section** — nearly the entire section's
+real content was being thrown away for what both pyOneNote's own loop and
+[MS-ONESTORE] agree is just a normal, expected end-of-fragment marker, not
+a genuinely unsupported type. Fixed in `_patches.py`'s `_filenode_init`:
+peek the 4-byte header before running the vendor dispatch at all; a
+terminator ID gets treated as one immediately (no data, no children,
+matching the "no data part" shape pyOneNote's own dispatch already uses
+for other structural end-markers) instead of running the crash-prone
+vendor code for it.
+
+**2. The same crash shape, for a genuinely unidentified type.** A second,
+different section hit the identical `self.data.ref` crash for
+`file_node_id 2` — NOT a terminator (only 0/255 are), and also absent from
+`_FileNodeIDs`. Tried reading a generic `FileNodeChunkReference` here first
+(the same structural field working for a different unhandled type in
+`_encryption_key_fnd_fix`, already in this file) and recursing into its
+children the way pyOneNote's own dispatch would have — but on the real
+file this decoded a garbage `stp` offset (`ValueError: cannot fit 'int'
+into an offset-sized integer`), meaning this ID's real byte layout isn't a
+plain chunk reference (or this is genuinely corrupted/misaligned data, not
+a rare-but-valid type). Recursing into that would risk building on garbage
+rather than just losing one node's subtree, so this case gets the same
+safe "no data, no children" fallback as the terminator case — capping the
+damage to whatever's structurally beneath this ONE anomalous node instead
+of either crashing the whole section or misreading further content from a
+bad offset.
+
+**3. `OneDocment.get_json()` crashes on an incomplete file declaration.**
+A separate bug, hit by 6 of the 8 failing sections:
+`get_json()` calls `.hex()` unconditionally on every `get_files()` entry's
+`content` — but a file declaration
+(`ObjectDeclarationFileData3RefCountFND`) whose referenced blob genuinely
+never showed up anywhere in the file (a real, legitimate state for a
+heavily-pruned revision history — not itself a bug, just an incomplete
+cross-reference left over from old edits) leaves that entry's `content` at
+`get_files()`'s own string default (`""`), and `"".hex()` raises
+`AttributeError: 'str' object has no attribute 'hex'` — aborting the
+entire section for one incomplete, usually-irrelevant declaration. Fixed
+with `OneDocment.get_json` patched to guard the same way the original
+should have: `.hex()` only when content is real bytes, `''` otherwise.
+
+**Verified**: all three fixes together took the real notebook from 8
+crashed sections (0 pages each) to 0 — `title` (successfully converted
+page count) went from 829 to 1948 in the same run, only these fixes
+changed. No regressions found on any existing test file (page/failure
+counts identical before and after, both smaller test notebooks and the
+first real notebook from the previous round of testing).
+
+## Section/group names can come back mojibake'd from CAB extraction
+
+Also found on the same real shared notebook: a section name with Estonian
+non-ASCII characters (ö, ü) extracted as double-encoded mojibake —
+`"Hommikusöögiks"` became `"HommikusÃ¶Ã¶giks"` — the classic "real UTF-8
+bytes decoded as Latin-1, then re-encoded as UTF-8" shape, coming from
+`expand.exe`/`cabextract` (external tools this package doesn't control),
+not from this package's own code. Fixed with `convert._fix_mojibake`:
+round-trip the name through Latin-1-encode -> UTF-8-decode. This doubles
+as its own safety check — it only succeeds for a string that's ACTUALLY
+this exact mojibake shape. An all-ASCII name round-trips back to itself
+unchanged (harmless no-op); a name with genuine, correctly-encoded Unicode
+outside Latin-1's range (confirmed on the same notebook: a section legitimately
+named "Meie Maja™") fails at the very first step — Latin-1 can't represent
+U+2122 at all — so it's left alone rather than risk mangling it further.
+
+**A separate, DIFFERENT-looking case was investigated and left alone**: a
+section named "Skills, Tools" (confirmed by the user against the real
+notebook) extracted as `"Skills^J Tools"` — a comma replaced by the
+literal two-character sequence `^J`. This is NOT the same bug as the
+mojibake above (comma is an ordinary ASCII character, not something UTF-8/
+Latin-1 double-encoding would ever produce from it) and, with only one
+observed example, there isn't enough evidence to build a safe, verified
+un-escaping rule the way the mojibake fix above has (that one had multiple
+independent real examples, `Ã¶` for `ö` confirmed in three different
+filenames, and a well-understood, well-known root cause). Left as an
+observed, undiagnosed cosmetic quirk of the extraction step rather than
+guessed at — `SectionResult.name` may not always exactly match a section's
+true display name when it contains punctuation `expand.exe`/CAB
+extraction treats as filesystem-special.
+
 ## `pyOneNote` is version-pinned, not `>=`
 
 `pyproject.toml` pins `pyOneNote==0.0.2` exactly. This package's

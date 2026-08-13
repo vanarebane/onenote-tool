@@ -69,6 +69,28 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions match
   printing a page title containing a character outside the console's legacy
   codepage — after the conversion itself had already succeeded. Reconfigures
   stdout/stderr to UTF-8 at CLI import time.
+- A plain pasted picture (not an embedded-file's preview) in a format this
+  tool can't decode (.emf/.xps) used to vanish with no trace on the page,
+  despite `report.failed` correctly tallying it. Now leaves the same kind
+  of visible placeholder as every other genuinely-unsupported element.
+- **Three real pyOneNote bugs, found testing a real ~220MB/61-section
+  notebook shared between two users**: (1) `FileNode.__init__` crashed
+  constructing its own fragment's end-of-fragment terminator marker
+  (`file_node_id` 0 or 255) before pyOneNote's own loop ever got a chance
+  to recognize it and stop cleanly — confirmed losing 93% of a real 19MB
+  section's content to this; (2) the same crash shape for a second,
+  genuinely-unidentified node type; (3) `OneDocment.get_json()` crashed
+  calling `.hex()` on an incomplete file declaration (a real, legitimate
+  leftover from a pruned revision history, not itself a bug). Together
+  these were aborting 8 of 61 real sections entirely (each caught
+  gracefully, but reduced to a single error placeholder). Fixed all
+  three; the same real notebook now converts 0 crashed sections, 1948
+  successfully-converted page titles (up from 829 pre-fix, same run).
+- Section/section-group names with non-ASCII characters (Estonian ö/ü)
+  could come back double-encoded mojibake from CAB extraction (an
+  external-tool issue, not this package's own code) — e.g.
+  "Hommikusöögiks" as "HommikusÃ¶Ã¶giks". Fixed with a verified,
+  self-checking round-trip correction (`convert._fix_mojibake`).
 - A revision-store region-collapse bug: multiple floating boxes on one page
   were being merged into a single region because their key used only the
   page's base GUID, not each box's own full identity.
