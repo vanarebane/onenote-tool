@@ -443,8 +443,8 @@ Legend: ✅ complete and verified · ⚠️ partial / best-effort · ❌ not imp
 | Font size / family | ✅ (only where the run explicitly overrides the paragraph default — see below) | ⚠️ (same per-run decode ceiling as other formatting) |
 | Bulleted / numbered lists, incl. nesting | ✅ | ⚠️ (wired in; verified partial on a real file — ~47% of the objects needed for list membership and ~25% for ordered-vs-bullet decoded) |
 | Hyperlinks (standalone + inline) | ✅ | ⚠️ (mechanism is wired in, same per-run decode ceiling as formatting) |
-| Images (inline/pasted) | ✅ | ✅ |
-| Embedded files / attachments (non-image) | ✅ | ✅ |
+| Images (inline/pasted) | ✅ (real pyOneNote bug found and fixed testing a real ~250MB notebook: `get_files()` collapses multiple identities that share one underlying blob — e.g. the same photo pasted on two pages — into a single last-wins slot, silently orphaning the rest; see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) | ✅ |
+| Embedded files / attachments (non-image) | ✅ (same fix as above) | ✅ |
 | Audio recordings | ✅ (inline `<audio>` player) | ✅ (verified against real .wav/.ogg attachments — extension classification, not page attribution, is what's proven here; a file can still land on the wrong page under the pre-existing structural-clustering spillover) |
 | Video attachments | ✅ (inline `<video>` player) | ✅ (same — verified against real .mp4/.webm/.wmv attachments) |
 | Tables | ✅ (correct cell placement; cells render with the same formatting/alignment/lists/background-color as body text — see below) | ❌ (wired in, but every `jcidTableNode` in the test file decoded to a completely empty property set — 0/6 across both protected sections tested; see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) |

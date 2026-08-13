@@ -257,6 +257,7 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
 
     candidates = [p for p in (passwords or []) if p]
     wrong_password = False
+    files_by_identity = None
     with open(path, 'rb') as fh:
         if not check_valid(fh):
             raise RuntimeError('not a valid OneNote .one file')
@@ -306,8 +307,13 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
                     # needs the shadow/decrypt context too, or it silently
                     # reads raw ciphertext the moment anything (including
                     # get_json() below) first touches it after this window
-                    # closes.
+                    # closes. `files_by_identity()` does its own separate
+                    # node traversal (see `_patches`) touching the exact
+                    # same FileDataStoreObjectReferenceFND nodes — compute
+                    # it here too, inside the same window, for the same
+                    # reason.
                     document.get_files()
+                    files_by_identity = document.files_by_identity()
                 finally:
                     _active_shadow[0] = None
                     _active_decrypt[0] = None
@@ -328,11 +334,12 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
         # further down — it never reads a real value from it.
 
         data = document.get_json()
-        files_by_identity = {}
-        for _g, fmeta in (document.get_files() or {}).items():
-            ident = _extract_guid(fmeta.get('identity'))
-            if ident:
-                files_by_identity[ident] = fmeta
+        if files_by_identity is None:
+            # Unprotected, or protected-with-no-usable-password (the probe-
+            # pass document — harmless to call here too: `files_by_identity`
+            # only walks structural/plaintext node types, same as the
+            # marker-detection probe itself relies on).
+            files_by_identity = document.files_by_identity()
 
     props = data.get('properties', [])
 
@@ -839,13 +846,30 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
 
     # Report files that ended up neither an inline image nor an attached
     # download link (e.g. a preview-only file with no matching embed node).
-    for _g, fmeta in (data.get('files') or {}).items():
+    # Walks `files_by_identity` (every real declaration, keyed by its own
+    # identity — see `_patches.files_by_identity`), NOT the raw
+    # `document.get_files()` dict `data['files']` — that dict is keyed by
+    # blob storage guid and keeps only one (last-wins) identity per blob,
+    # so it can't even NAME the other identities that share a blob, let
+    # alone check whether THEY were separately consumed.
+    # A revision-duplicate declaration (the SAME byte content already
+    # attached to a page under a DIFFERENT identity — verified real: a PDF
+    # legitimately declared twice, once per revision generation) isn't a
+    # real loss. Seed the dedup set from every identity actually consumed
+    # so an orphaned sibling declaration of already-recovered content isn't
+    # reported a second time.
+    reported_content = {
+        fmeta.get('content') for ident, fmeta in files_by_identity.items()
+        if ident in consumed_file_idents
+    }
+    for ident, fmeta in files_by_identity.items():
         ext = (fmeta.get('extension') or '').lower()
-        if ext in _IMAGE_EXTS:
+        if ext in _IMAGE_EXTS or ident in consumed_file_idents:
             continue
-        ident = _extract_guid(fmeta.get('identity'))
-        if ident in consumed_file_idents:
+        content = fmeta.get('content')
+        if content in reported_content:
             continue
+        reported_content.add(content)
         report.fail(f'file{ext or "?"}')
 
     # Order pages as OneNote does (the section's page-series list); groups with no

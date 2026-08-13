@@ -55,6 +55,20 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions match
   underlying file (confirmed on a real PDF) — added a same-base-GUID
   fallback that only resolves when unambiguous, so it can't misattach among
   genuinely different files sharing a base GUID.
+- **Real pyOneNote bug, found testing a real ~250MB/21-section notebook**:
+  `OneDocment.get_files()` collapses multiple object identities that
+  reference the exact same underlying file blob (e.g. the same photo pasted
+  on two different pages) into a single last-wins identity, silently
+  orphaning every other identity that legitimately points at that blob —
+  135 of ~350 real pasted images unresolvable in one section alone. Fixed
+  with a proper identity-preserving index (`OneDocment.files_by_identity()`)
+  used everywhere image/attachment bytes are resolved. Verified end-to-end:
+  `image_missing_data` 257 -> 0 on the real notebook, no regressions on any
+  existing test file (full before/after content diff).
+- CLI: `onenote-tool convert` could crash on Windows with `UnicodeEncodeError`
+  printing a page title containing a character outside the console's legacy
+  codepage — after the conversion itself had already succeeded. Reconfigures
+  stdout/stderr to UTF-8 at CLI import time.
 - A revision-store region-collapse bug: multiple floating boxes on one page
   were being merged into a single region because their key used only the
   page's base GUID, not each box's own full identity.

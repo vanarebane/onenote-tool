@@ -332,6 +332,55 @@ try:  # pyOneNote is a required dependency at parse time, but importing
 
     OneDocment.get_properties = _get_properties
 
+    # pyOneNote bug fix: `OneDocment.get_files()` keys its own dict by the
+    # file-data blob's OWN storage guid, and for each declaration
+    # (`ObjectDeclarationFileData3RefCountFND`) does
+    # `self._files[guid]["identity"] = str(node.data.oid)` — last-wins,
+    # once per blob. When the exact same underlying blob is legitimately
+    # declared under MULTIPLE different object identities — verified on a
+    # real 250+MB notebook: the identical photo pasted on two different
+    # pages (two different base GUIDs, byte-identical content) — only the
+    # LAST-processed identity survives as resolvable; every OTHER identity
+    # that legitimately points at that same blob is unreachable through
+    # `get_files()`'s own dict, even though the bytes are genuinely present
+    # in the file. Silently dropped 135 of ~350 real pasted images on one
+    # real section alone (all `PictureContainer` lookups miss, `images.py`
+    # correctly reports `image_missing_data` for each — not a false
+    # negative on THIS tool's part, but a real gap `get_files()` itself
+    # leaves).
+    #
+    # Fixed by indexing both directions ourselves: every declaration's own
+    # (oid -> blob guid) pair (not just the last one per blob), then
+    # resolving oid -> bytes through that — a superset of what
+    # `get_files()` returns, never a narrower one. `document.get_files()`
+    # itself is left completely unpatched (still used by the password-
+    # decryption path exactly as before, at the same file-position/window
+    # its own lazy, decrypt-context-sensitive `FileDataStoreObject` read
+    # needs) — this is an ADDITIONAL method, not a replacement.
+    def _files_by_identity(self):
+        nodes = []
+        OneDocment.traverse_nodes(self.root_file_node_list, nodes, [
+            'ObjectDeclarationFileData3RefCountFND', 'FileDataStoreObjectReferenceFND',
+        ])
+        blob_by_guidref = {}
+        decl_by_oid = {}
+        for node in nodes:
+            d = getattr(node, 'data', None)
+            if isinstance(d, _pyonenote_filenode.FileDataStoreObjectReferenceFND):
+                blob_by_guidref[str(d.guidReference)] = d.fileDataStoreObject.FileData
+            elif isinstance(d, _pyonenote_filenode.ObjectDeclarationFileData3RefCountFND):
+                g = d.FileDataReference.StringData.replace('<ifndf>{', '').replace('}', '').lower()
+                decl_by_oid[str(d.oid)] = (g, d.Extension.StringData)
+
+        out = {}
+        for oid, (g, ext) in decl_by_oid.items():
+            content = blob_by_guidref.get(g)
+            if content:
+                out[oid] = {'content': content, 'extension': ext}
+        return out
+
+    OneDocment.files_by_identity = _files_by_identity
+
     # pyOneNote raises NotImplementedError on property type 0x10 (ArrayOfPropertyValues)
     # mid-way through reading an object's property set, which aborts the ENTIRE .one
     # file (every page in the section is lost). Each object's property set is read at

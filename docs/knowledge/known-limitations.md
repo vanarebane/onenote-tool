@@ -250,31 +250,75 @@ alignment. `TableColumnsLocked` (an editing-lock bitmask, not visible
 content) was deliberately left unexposed — its semantics are unverified and
 it doesn't affect what a converted page looks like.
 
-## Embedded-file identity can be stale — another real revision-store bug
+## Embedded-file/image identity resolution: a real pyOneNote bug, found small then found big
 
-Found while chasing full unprotected-section coverage: a real PDF
-attachment was silently failing to attach to its page at all (`report
-.failed['file.pdf']`) despite its bytes clearly being present in the file.
-Root cause: the `jcidEmbeddedFileNode`'s `EmbeddedFileContainer` reference
-pointed at revision `,33` of its base object, but pyOneNote's own
-`get_files()` (last-wins per real file) had recorded the actual content
-under revision `,40` of that *same* base GUID — the exact same "a reference
-captured at one point in time can point at a stale revision" shape this
-project has already found and documented for page titles and images, now
-confirmed for file attachments too.
+**First pass (small, real .onepkg test data)**: a real PDF attachment was
+silently failing to attach to its page at all (`report.failed['file.pdf']`)
+despite its bytes clearly being present in the file. Root cause: the
+`jcidEmbeddedFileNode`'s `EmbeddedFileContainer` reference pointed at
+revision `,33` of its base object, but pyOneNote's own `get_files()`
+(last-wins per real file) had recorded the actual content under revision
+`,40` of that *same* base GUID. Fixed at the time in
+`images._build_embedded_file`: on an exact-identity miss, retry by base
+GUID — but ONLY when that resolves to **exactly one** non-image candidate
+(a base GUID is not a safe 1:1 proxy for "one real file": verified that a
+page with two genuine, different audio attachments, `.wav` and `.ogg`, has
+both sharing one base GUID — an ambiguous match falls through to normal
+failure reporting rather than guessing).
 
-Fixed in `images._build_embedded_file`: on an exact-identity miss, retry by
-base GUID (ignoring the revision counter) — but ONLY when that resolves to
-**exactly one** non-image candidate. A base GUID is not a safe 1:1 proxy for
-"one real file" on its own — verified on the same real file that a page
-with two genuine, different audio attachments (`.wav` and `.ogg`) has both
-sharing one base GUID — so an ambiguous match (0 or 2+ non-image
-candidates) deliberately falls through to the existing failure-reporting
-path rather than guessing. Also had to mark the *resolved* identity (not
-just the originally-requested, stale one) as consumed, or the file would
-attach correctly to its page yet still get double-reported as an orphan by
-the end-of-parse unresolved-file check, which walks `get_files()`'s own
-identities independently.
+**Second pass (the real root cause, found testing a real ~250MB, 21-section
+notebook)**: that first fix was treating a symptom. The actual bug is in
+`OneDocment.get_files()` itself. It keys its own dict by the file-data
+blob's storage GUID, and for each declaring node
+(`ObjectDeclarationFileData3RefCountFND`) does
+`self._files[guid]["identity"] = str(node.data.oid)` — **last-wins, once
+per blob**. When the exact same underlying blob is legitimately declared
+under multiple different object identities — confirmed on the real
+notebook: the identical photo pasted on two different pages (two different
+base GUIDs entirely, not even a revision-counter difference), byte-identical
+content — only the LAST-processed identity survives as resolvable through
+`get_files()`. Every other identity that legitimately references that same
+blob is unreachable, even though the bytes are genuinely present. This
+single bug accounted for **135 of ~350 real pasted images silently failing
+to resolve in one section alone** (`image_missing_data`), and, at the whole
+notebook level, real `.wav`/`.zip`/`.pdf` attachments failing too — the
+`,33`-vs-`,40` PDF case above was actually this same bug, not a simple
+stale-revision-counter issue: `,33` was ALSO a genuine, independent
+declaration of the identical content, just the one `get_files()` didn't
+keep.
+
+Fixed properly in `_patches.py`'s `OneDocment.files_by_identity()` (an
+additional method, `get_files()` itself is left untouched — the password-
+decryption path still needs it called exactly where it already is, inside
+the shadow-decrypt context window its lazy `FileDataStoreObject` read
+depends on): index **both directions** directly — every declaration's own
+`(oid -> blob guid)` pair, not just the last one per blob — then resolve
+`oid -> bytes` through that. A strict superset of what `get_files()` alone
+returns, never narrower. `parser.py` now uses this everywhere
+`files_by_identity` is built; the original base-GUID fallback in
+`images._build_embedded_file` is left in place as a safety net for a
+genuinely-dangling reference (a stale identity that was truly never
+declared at all — a real, if now much rarer, possibility) rather than
+removed, since it's still correct, just no longer the common case's fix.
+
+The end-of-parse "orphan file" check (unresolved, unattached files) needed
+a matching fix: it now walks `files_by_identity` itself (every real
+identity) instead of `document.get_files()`'s collapsed dict, with a
+content-based dedup seeded from every already-consumed identity's own
+bytes — otherwise a revision-duplicate declaration of content ALREADY
+correctly attached under a sibling identity (the `,33`/`,40` PDF case)
+would get double-reported as a false "still missing" failure.
+
+Verified end-to-end on the real 250MB+ notebook: `image_missing_data`
+257 -> 0, `file.wav`/`file.zip` failures resolved, `image` (successfully
+converted) 656 -> 704, `embedded_preview` 20 -> 31 — all on the SAME real
+data, same run, only this fix changed. Also verified with a full before/
+after content diff against every smaller real test file: page/block counts
+unchanged everywhere, and every page's content is byte-identical **except**
+where this fix recovers something the old code genuinely missed (one real
+file: 2 of 22 pages differ, both gaining a previously-unresolvable audio/
+video preview thumbnail — `embedded_preview` 6 -> 9, `image_missing_data`
+3 -> 0 on that file) — no regressions found anywhere.
 
 ## Math equations: detected, replaced with an honest placeholder
 
@@ -638,6 +682,26 @@ being the expected, structural answer rather than something still open.
 Both are explicitly requested future work, not yet designed or attempted —
 noted here so they don't get lost, not because anything below has scoped
 them out.
+
+## CLI: a Windows console encoding crash, found converting a real notebook
+
+Real bug, found running `onenote-tool convert` on a real ~250MB notebook:
+it crashed with `UnicodeEncodeError` after **1m18s of successful
+conversion work**, deep inside `typer`/`click`'s own `echo()`, printing a
+page title. Windows' console defaults to a legacy codepage (cp1252), not
+UTF-8 — any printed text containing a character outside that codepage
+(a real page title here: `'￼￼￼'`, Unicode's OBJECT
+REPLACEMENT CHARACTER, from a page whose title area holds only embedded
+objects) crashes the whole process, losing the conversion report for a
+display-only reason with no connection to parsing correctness at all.
+
+Fixed in `cli/main.py`: reconfigure `sys.stdout`/`sys.stderr` to UTF-8 with
+`errors='replace'` (never raises; an unencodable character prints as
+U+FFFD instead of crashing) at **import** time, not only under
+`if __name__ == '__main__':` — the installed `onenote-tool` console script
+calls `app` directly without going through that guard, so a fix placed
+there wouldn't apply to a real install. Verified: the same real 250MB
+notebook now converts and prints its full report without error.
 
 ## Testing has real gaps
 
