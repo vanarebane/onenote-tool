@@ -250,6 +250,150 @@ alignment. `TableColumnsLocked` (an editing-lock bitmask, not visible
 content) was deliberately left unexposed — its semantics are unverified and
 it doesn't affect what a converted page looks like.
 
+## Embedded-file identity can be stale — another real revision-store bug
+
+Found while chasing full unprotected-section coverage: a real PDF
+attachment was silently failing to attach to its page at all (`report
+.failed['file.pdf']`) despite its bytes clearly being present in the file.
+Root cause: the `jcidEmbeddedFileNode`'s `EmbeddedFileContainer` reference
+pointed at revision `,33` of its base object, but pyOneNote's own
+`get_files()` (last-wins per real file) had recorded the actual content
+under revision `,40` of that *same* base GUID — the exact same "a reference
+captured at one point in time can point at a stale revision" shape this
+project has already found and documented for page titles and images, now
+confirmed for file attachments too.
+
+Fixed in `images._build_embedded_file`: on an exact-identity miss, retry by
+base GUID (ignoring the revision counter) — but ONLY when that resolves to
+**exactly one** non-image candidate. A base GUID is not a safe 1:1 proxy for
+"one real file" on its own — verified on the same real file that a page
+with two genuine, different audio attachments (`.wav` and `.ogg`) has both
+sharing one base GUID — so an ambiguous match (0 or 2+ non-image
+candidates) deliberately falls through to the existing failure-reporting
+path rather than guessing. Also had to mark the *resolved* identity (not
+just the originally-requested, stale one) as consumed, or the file would
+attach correctly to its page yet still get double-reported as an orphan by
+the end-of-parse unresolved-file check, which walks `get_files()`'s own
+identities independently.
+
+## Math equations: detected, replaced with an honest placeholder
+
+OneNote's inline equation editor doesn't store a typeset formula — it
+stores plain Unicode text (the real math glyphs, e.g. italic 𝑥/𝑎/𝑛/𝑘) mixed
+with structural control characters from Microsoft's UnicodeMath "linear
+format" (fraction/superscript/radical delimiters drawn from the
+U+FDD0–FDEF noncharacter range — reserved by Unicode itself to never be
+assigned a real glyph, invisible or shown as tofu in any real font),
+flagged via `MathFormatting` on the run's character-style object
+(`jcidParagraphStyleObjectForText`, referenced through `TextRunFormatting`
+same as every other run-level style override). Rendering that text as-is,
+which this tool used to do, produced exactly that: real math glyphs glued
+together with literal noncharacter soup. Verified on a real file (the
+binomial theorem expansion) and cross-checked against the MHT ground
+truth — which turns out not to help here either: OneNote's own MHT export
+doesn't attempt a text/MathML form of an equation, it rasterizes it to a
+PNG (`<img src=...>`), same as it does for some other content this tool
+can't match pixel-for-pixel.
+
+Given no fraction/superscript layout engine exists here to interpret those
+delimiters, and matching OneNote's own raster-image fallback isn't
+feasible without a math typesetting engine, `parser._run_is_equation`
+detects `MathFormatting` and swaps in the same visible-placeholder
+convention used for every other genuinely-unsupported element
+(`rendering._placeholder_run`, tracked via `report.fail('equation')`).
+Stripping just the delimiter characters and keeping the bare glyphs was
+considered and rejected: flattening a nested formula loses which delimiter
+meant "start of an exponent" vs. "start of the whole fraction", so the
+result would read as a *plausible but wrong* formula — worse than an
+honest "not supported" marker, not better.
+
+## Page background color / rule lines: implemented, verified against 13 real pages
+
+The first attempt at this (see the superseded write-up this replaces) found
+one candidate property on `jcidPageMetaData` and couldn't confirm what it
+meant — no ground truth existed to check a guess against, so it was
+deliberately left unimplemented. A follow-up test file added a dedicated
+section with 13 pages — one per built-in OneNote rule-line pattern (Narrow
+Lines, College Ruled, Standard Rules, Wide Ruled, Small/Medium/Large/Very
+Large Grid), one with a plain page color, one with color + lines, one with
+neither ("None") — each page's own **title** stating exactly what was set,
+turning "no ground truth" into "13 independent ground-truth data points".
+
+Both real properties live on `jcidPageNode` (not `jcidPageMetaData`, the
+earlier guess), unnamed in pyOneNote's table the same way the table-merge
+and table-column-width properties were (read via the raw `body` escape
+hatch, `parser._page_style`):
+
+- **Rule-line pattern** (`0x0C00352D`, a 1-byte enum): values 1–8 matched
+  the 8 pattern-named pages' titles exactly, in order (1 = Narrow Lines,
+  ..., 8 = Very Large Grid) — not inferred, read directly off each test
+  page's own name. Absent on "None"/"Page color"/"Page size as A4", exactly
+  as expected.
+- **Page background color** (`0x14001D2A`, the same 4-byte RGB+alpha-flag
+  shape as every other color property in this codebase): present only on
+  "Page color" (`#f0f8fa`) and "Page colour and lines" (`#fceeee`) — both
+  plausible pastel swatches, absent on all 11 other pages.
+
+Exposed as plain `PageResult` fields (`background_color`: `'#rrggbb'` or
+`None`; `rule_lines`: one of 8 string names or `None`) — deliberately
+**not** baked into any block's `html`, unlike cell color/alignment: this is
+page-level presentation metadata, not page content, and whether/how to
+visualize it (a solid CSS background, an actual grid/ruled-line pattern
+image, neither) is a choice for the caller, same reasoning already used for
+`PageRegion`'s x/y/width/height.
+
+## Rule-line COLOR (separate from the page-color/rule-line-pattern above): not found, future work
+
+OneNote's "Rule Lines" submenu has its own **Rule Line Colour** picker,
+independent of both page color and the ruled/grid pattern above (an 18-swatch
+named palette — <none>/Light Blue (default)/Blue/Yellow/Green/Red/Purple/
+Cyan/Orange/Magenta/Blue Mist/Purple Mist/Tan/Lemon Lime/Apple/Teal/Red
+Chalk/Silver). Two real test pages confirm it's a genuine, independent
+per-page setting: "Coloured lines" (body text: *"This page has orange
+colored lines"*) and "Page colour and lines" (screenshotted directly by the
+user: pale-red page color + body text *"This page has 'Red' colour and
+lines with 'Red Chalk' colour"*) — same rule-line pattern (`college_ruled`)
+as plain "College Ruled", same or absent page-color as their siblings, but
+a visibly different line tint neither `rule_lines` nor `background_color`
+above accounts for.
+
+**Exhaustively searched, not found**, in two independent passes:
+
+1. A full key-by-key diff of "College Ruled" (default line color) against
+   "Coloured lines" (orange) — every raw PropertyID on their respective
+   `jcidPageNode` objects, not just the unnamed ones `_page_style` already
+   reads. Identical key sets; the only value differences are structural
+   refs and timestamps.
+2. A whole-file scan of every unnamed ("Unknown"-named) PropertyID across
+   all 13 real pages in the test section, looking for anything whose
+   occurrence count matched "exactly the pages known to override the
+   default line color" (2). Nothing did — every unnamed property found
+   is already accounted for by `rule_lines`/`background_color` above or by
+   unrelated per-object bookkeeping (author records, revision counters).
+
+Also disproved, along the way, this project's own earlier guess from before
+this test data existed: an unnamed `jcidPageMetaData` property
+(`0x1C0035CD`) once suspected of being a page-theme/style reference turns
+out to be a monotonically-increasing per-notebook counter (a fixed 16-byte
+prefix + a trailing value that increases by 4 on every single page in
+creation order) — unrelated to color, confirmed now that real comparative
+data across many pages exists to check it against.
+
+**Conclusion**: rule-line color isn't a property of the page's own object
+space at all. Left as real future work — the next things worth trying, in
+order of likely payoff: (a) check whether it's stored in the *notebook's*
+own metadata rather than per-page, since the palette's "default" checkmark
+(Light Blue) suggests a notebook- or app-level default that a page might
+only override via a *reference* rather than an inline value; (b) check
+whether it hangs off the page's outline/canvas structure object instead of
+`jcidPageNode` directly; (c) get a raw byte-level diff of two `.one` files
+that are identical except for this one setting (the fastest path, if a
+contributor can produce one) rather than continuing to reason from the
+already-decoded property names. Not attempted: guessing a value from the
+palette's swatch position (e.g. "Orange" = index 8) and shipping it
+unverified — same standing rule as everywhere else in this file, a property
+whose real storage location is unconfirmed doesn't get landed on a guess.
+
 ## Table-cell formatting had a real, now-fixed performance cost
 
 Resolving formatting for every table cell (the fix above) made

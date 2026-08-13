@@ -85,6 +85,16 @@ class PageResult:
     # purely additive, best-effort second view of the SAME content, not a
     # replacement.
     regions: list = field(default_factory=list)  # list[PageRegion]
+    # Page-level presentation metadata, not content — deliberately not baked
+    # into any block's html (same reasoning as `regions`' x/y/width/height):
+    # whether/how to visualize a page's background color or ruled/grid
+    # pattern is a choice for the caller, not this library. None/None for
+    # the overwhelmingly common case (OneNote only writes either property
+    # when it overrides the always-plain-white/no-lines default).
+    background_color: Optional[str] = None  # '#rrggbb' or None
+    # One of: 'narrow_lines', 'college_ruled', 'standard_rules', 'wide_ruled',
+    # 'small_grid', 'medium_grid', 'large_grid', 'very_large_grid', or None.
+    rule_lines: Optional[str] = None
 
 
 @dataclass

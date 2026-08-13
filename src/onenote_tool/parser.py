@@ -27,9 +27,9 @@ from .models import ElementReport, PageRegion, PageResult
 from .ordering import _object_space_order, _page_content_order, _page_regions
 from .recovery import _flat_recover_protected_pages
 from .rendering import (
-    _RTU_MARKER, _child_ids, _has_visible_content, _image_block_html, _list_is_ordered, _media_block_html,
-    _paragraph_alignment, _placeholder_blocks, _placeholder_run, _placeholder_text, _resolve_run_format,
-    _resolve_table_grid, _runs_to_paragraphs, _rtu_to_inline_html, _table_html,
+    _RTU_MARKER, _child_ids, _color_from_bytes, _has_visible_content, _image_block_html, _list_is_ordered,
+    _media_block_html, _paragraph_alignment, _placeholder_blocks, _placeholder_run, _placeholder_text,
+    _resolve_run_format, _resolve_table_grid, _runs_to_paragraphs, _rtu_to_inline_html, _table_html,
 )
 from .stamps import _is_stamp, classify_stamp
 from .text import _clean_text, _clean_title, _extract_guid, _le_int, _norm_identity, decode_run_text
@@ -85,6 +85,76 @@ def _run_guid(val) -> Optional[str]:
     """The object-space ExtendedGUID (page id) referenced by a run's formatting."""
     m = _GUID_RE.search(str(val.get('TextRunFormatting', '')))
     return m.group(1) if m else None
+
+
+# Both raw PropertyIDs below are unnamed in pyOneNote's own table (decode as
+# "Unknown", dropped by get_properties() before a caller ever sees them —
+# read via the raw PropertySet body kept on prop['body'], same escape hatch
+# `ink.py`/`rendering._cell_merge_span` use for other properties pyOneNote
+# has no name for). Verified against 13 real pages, one per built-in
+# rule-line pattern plus two Page Color pages: the enum value below matches
+# each page's OWN title exactly (e.g. the page titled "Narrow Lines" reads
+# 1, "Very Large Grid" reads 8 — not inferred, read directly off the ground
+# truth each test page's name already states), and the two Page Color pages'
+# raw bytes decode via the same 4-byte RGB+alpha-flag shape every other
+# color property in this codebase uses, into plausible pastel swatches
+# (#F0F8FA, #FCEEEE) — never present on any of the 11 non-color pages.
+_PRID_RULE_LINES = 0x0C00352D
+_PRID_PAGE_COLOR = 0x14001D2A
+_RULE_LINES_NAMES = {
+    1: 'narrow_lines', 2: 'college_ruled', 3: 'standard_rules', 4: 'wide_ruled',
+    5: 'small_grid', 6: 'medium_grid', 7: 'large_grid', 8: 'very_large_grid',
+}
+
+
+def _page_style(page_node_prop) -> tuple:
+    """(background_color, rule_lines) off a page's own `jcidPageNode` — a
+    plain data pair, deliberately not rendered into any block's `html`
+    here: this is page-level metadata, not content, and how (or whether) to
+    visualize it — a solid CSS background, an actual ruled/grid pattern
+    image, neither — is a presentation choice for the caller, same
+    reasoning already applied to `PageRegion`'s x/y/width/height. Absent
+    (None, None) for the overwhelmingly common case (OneNote only writes
+    either property when it overrides the always-plain-white/no-lines
+    default)."""
+    body = (page_node_prop or {}).get('body') if page_node_prop else None
+    if body is None:
+        return None, None
+    color, rule_lines = None, None
+    for prid, data in zip(getattr(body, 'rgPrids', ()), getattr(body, 'rgData', ())):
+        if prid.value == _PRID_PAGE_COLOR and isinstance(data, (bytes, bytearray)) and len(data) == 4:
+            color = _color_from_bytes(data)
+        elif prid.value == _PRID_RULE_LINES and isinstance(data, (bytes, bytearray)) and len(data) == 1:
+            rule_lines = _RULE_LINES_NAMES.get(data[0])
+    return color, rule_lines
+
+
+def _run_is_equation(val, by_id) -> bool:
+    """True when this run's `TextRunFormatting` carries `MathFormatting`.
+
+    OneNote's own inline-equation editor doesn't store a typeset formula —
+    it stores plain Unicode text mixed with structural control characters
+    from Microsoft's UnicodeMath "linear format" (superscript/fraction/
+    radical delimiters drawn from the U+FDD0-FDEF noncharacter range,
+    invisible/undefined in any real font), flagged with `MathFormatting`
+    on the run's character-style object. Rendering that text as-is (as this
+    tool used to) produces the formula's real math glyphs interleaved with
+    literal noncharacter soup — confirmed on a real file (the binomial
+    theorem: `x`, `a`, `n`, `k` in math italic, correct in isolation, glued
+    together with the raw delimiter codepoints). There's no fraction/
+    superscript layout engine here to interpret those delimiters properly,
+    and OneNote's own MHT export doesn't attempt a text/MathML form either —
+    it rasterizes the equation to a PNG. A placeholder (same convention as
+    every other genuinely-unsupported element in this codebase) is the
+    honest option; stripping just the delimiters and keeping the bare
+    glyphs was considered and rejected — flattening a nested formula (which
+    delimiter meant "start of exponent" vs. "start of the whole fraction")
+    loses the grouping, and the result reads as a *plausible but wrong*
+    formula instead of visibly-not-a-formula, which is worse."""
+    trf_ref = val.get('TextRunFormatting')
+    tr_ref = (trf_ref[0] if trf_ref else None) if isinstance(trf_ref, list) else trf_ref
+    trf = by_id.get(_norm_identity(tr_ref)) if tr_ref else None
+    return bool(trf) and str((trf.get('val') or {}).get('MathFormatting', '')).lower() == 'true'
 
 
 def _build_blocks(runs, tables, images, ink_container_ids, files, by_id, used_thumb_refs, report=None) -> list:
@@ -316,6 +386,19 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
                     page_title_by_guid[guid] = t
                     page_level_by_guid[guid] = level
 
+    # Page background color / rule-lines pattern — see `_page_style`. A
+    # `jcidPageNode`'s own identity base-guid equals its page's object-space
+    # guid, same correlation `page_title_by_guid` above already relies on.
+    page_style_by_guid = {}
+    for prop in props:
+        if prop.get('type', '') != 'jcidPageNode':
+            continue
+        color, rule_lines = _page_style(prop)
+        if color or rule_lines:
+            guid = (_norm_identity(prop.get('identity')) or '').split(',')[0] or None
+            if guid and guid not in page_style_by_guid:
+                page_style_by_guid[guid] = (color, rule_lines)
+
     # List membership: an outline element carrying a ListNodes ref is a list item;
     # its content rich-text run(s) become <li>. Bullet glyph -> <ul>, else <ol>.
     # OutlineElementChildLevel (1-based) drives nesting.
@@ -427,6 +510,16 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
                     grp['run_ids'].add(run_id)
                     grp['runs'].append({'t': '', 'h': '', 'rid': run_id, 'blank': True})
                     report.ok('blank_paragraph')
+                continue
+            if _run_is_equation(val, by_id):
+                if run_id is None or run_id not in grp['run_ids']:
+                    if run_id is not None:
+                        grp['run_ids'].add(run_id)
+                    grp['runs'].append(_placeholder_run(
+                        'a math equation',
+                        "OneNote's inline-equation control characters can't be laid out here",
+                    ))
+                    report.fail('equation')
                 continue
             if inline_html is None:
                 kind, value = classify_stamp(text)
@@ -727,6 +820,7 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
                     x=rmeta['x'], y=rmeta['y'], width=rmeta['width'], height=rmeta['height'], blocks=r_blocks,
                 ))
 
+        page_color, page_rule_lines = page_style_by_guid.get(_guid, (None, None))
         pages.append((
             page_order.get(_guid, 10 ** 9),
             PageResult(
@@ -738,6 +832,8 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
                 files=files,
                 sub_level=max(0, page_level_by_guid.get(_guid, page_levels.get(title, 1)) - 1),
                 regions=regions,
+                background_color=page_color,
+                rule_lines=page_rule_lines,
             ),
         ))
 

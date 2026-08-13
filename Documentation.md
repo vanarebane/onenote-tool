@@ -150,6 +150,10 @@ class PageResult:
     files: list              # list[PageFile] — the raw bytes behind any 'file_links'/'audio'/'video' block
     sub_level: int = 0        # OneNote page indent: 0 = top level, 1 = sub-page, ...
     regions: list = []        # list[PageRegion] — see "PageResult.regions" below
+    background_color: str | None = None  # '#rrggbb', or None (plain white — the common case)
+    rule_lines: str | None = None        # 'narrow_lines'|'college_ruled'|'standard_rules'|
+                                          # 'wide_ruled'|'small_grid'|'medium_grid'|'large_grid'|
+                                          # 'very_large_grid', or None (no lines — the common case)
 
 @dataclass
 class PageImage:
@@ -287,6 +291,19 @@ notably, **password-protected-section recovery doesn't implement this at
 all** (see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md))
 — so always use `blocks` for content and treat `regions` as best-effort
 positioning on top of it, never the other way around.
+
+### `PageResult.background_color` / `.rule_lines` — page-level presentation
+
+Two plain, optional page properties — OneNote's own "Page Color" and
+"Rule Lines" page-setup options. Neither is baked into `blocks` html:
+whether and how to visualize a page's background color or ruled/grid
+pattern (a solid CSS `background-color`, an actual rendered grid/line
+pattern, or neither at all) is entirely a decision for the code calling
+this library, same reasoning as `PageRegion`'s x/y/width/height above.
+Both are `None` for the overwhelmingly common case (OneNote only writes
+either property when a page overrides the always-plain-white/no-lines
+default) — never guess a color or pattern for a page where these are
+`None`, that's the correct, common, unstyled state.
 
 ## Password handling
 
@@ -438,12 +455,23 @@ Legend: ✅ complete and verified · ⚠️ partial / best-effort · ❌ not imp
 | YouTube embeds (thumbnail-matched) | ✅ | ⚠️ (embed itself wired in and renders correctly; thumbnail pre-matching not attempted; unverified against real decoded data — see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) |
 | Paragraph text alignment (left/center/right) | ✅ | ⚠️ (same per-run decode ceiling as other formatting) |
 | Floating-box canvas layout (`page.regions`) | ✅ (position/size per top-level content box, verified against a real 6-box page) | ❌ (tried directly against a real protected copy of that same 6-box page — the 5-level reference chain needed never decoded intact for even one page; see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) |
-| Page titles | ✅ | ⚠️ (commonly ~50–100% depending on the file; some titles are never recoverable at all) |
+| Page titles | ⚠️ (a renamed page can leave both its old and new title text under the same identity with no reliable signal which is current — `page_title_by_guid`'s first-occurrence-wins picks correctly on some pages, stale on others, same file; see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) | ⚠️ (commonly ~50–100% depending on the file; some titles are never recoverable at all) |
 | Page order within a section | ✅ | ⚠️ (structural file-position order used as a proxy, not verified against OneNote's own page-series order) |
 | Section groups / folders | ✅ | ✅ (comes from the `.onepkg` archive structure, unaffected by a section's own encryption) |
 | Date/time auto-stamps → page `created_at` | ✅ | ✅ |
 | Page indent level (sub-pages) | ✅ | ⚠️ (reads the same `PageLevel` property as the normal pipeline; verified recovering a real secondary-level page — bounded by the usual per-object decode ceiling, so a page whose own `PageMetaData` didn't decode still defaults to top-level) |
 | Revision-duplicate cleanup (no ghost/duplicate pages) | ✅ | ⚠️ (actively handled with a dedicated dedup pass; some spillover cases are documented, not all eliminated) |
+| Embedded Office files (Excel, PDF, 3D models, generic attachments) | ✅ (no dedicated handling needed — the same generic attachment path already covering .zip/.wav/etc.; a real revision-store identity mismatch found and fixed along the way, see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) | ⚠️ (same per-object decode ceiling as everything else in a protected section) |
+| Math equations (OneNote's inline equation editor) | ⚠️ (detected and replaced with an honest placeholder — the underlying Unicode "linear format" control characters aren't laid out into a real formula, and OneNote's own MHT export doesn't do this either, it rasterizes to an image; see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) | ❌ (same detection mechanism, untested against protected content) |
+| Page background color / rule-lines pattern | ✅ (`PageResult.background_color` / `.rule_lines` — plain page-level properties, not baked into `blocks` html; rendering/visualizing them is left to the caller. Verified against 13 real pages, one per built-in pattern plus color variants — see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) | ❌ (untested against protected content) |
+| Rule-line **color** (separate from the pattern/page-color above — OneNote's own "Rule Line Colour" picker) | ❌ (real, independent per-page setting, confirmed on 2 real test pages — exhaustively searched (full property-key diff + whole-file unnamed-property scan) and not found anywhere in the page's own object space; not guessed at, left as documented future work — see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) | ❌ |
+| Visio objects, page tags ("Important"/"To Do") | ❌ (never tested — not in `Test.onepkg`; falls back to the generic lossy-by-design placeholder + `ElementReport.failed`, not silently dropped, but no dedicated handling exists) | ❌ (same, plus the usual protected-section decode ceiling) |
+
+Table A tracks every content type this project has actually built and
+verified against real files — it is not a claim that every OneNote feature
+exists. The last row above lists what's known to be genuinely out of scope
+today; anything not in this table at all (any OneNote feature not
+mentioned anywhere above) hasn't been evaluated either way.
 
 Font size/family is deliberately **not** mapped from `ParagraphStyle` (the
 paragraph's own default, present on essentially every run) — only from a run's

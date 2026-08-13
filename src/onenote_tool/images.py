@@ -179,6 +179,36 @@ def _build_embedded_file(val, files_by_identity, file_counter, consumed_file_ide
     """
     identity = _extract_guid(val.get('EmbeddedFileContainer'))
     fmeta = files_by_identity.get(identity)
+    if fmeta is None and identity:
+        # Real revision-store mismatch, verified on a real file: this
+        # reference can point at a STALE revision of the same base object —
+        # `get_files()` (pyOneNote) only keeps one, its own last-wins,
+        # `ObjectDeclarationFileData3RefCountFND` per real file, which can
+        # be a LATER revision than whatever this particular
+        # `EmbeddedFileContainer` reference was captured against (a real
+        # PDF: the reference pointed at revision ",33", the actual content
+        # ended up recorded under ",40" of the same base GUID). Fall back to
+        # matching by base GUID (ignoring the revision counter) — but ONLY
+        # when that resolves to exactly one non-image candidate; a base GUID
+        # groups every object declared in the same revision-manifest batch,
+        # not just one file's own revisions (verified: a page with two real
+        # audio attachments has both sharing one base GUID), so with 0 or
+        # 2+ candidates this doesn't guess, it just leaves the normal
+        # unresolved-file failure path below to report it, same as before.
+        base = identity.split(',')[0]
+        candidates = [
+            (k, v) for k, v in files_by_identity.items()
+            if k.split(',')[0] == base and (v.get('extension') or '').lower() not in _IMAGE_EXTS
+        ]
+        if len(candidates) == 1:
+            resolved_identity, fmeta = candidates[0]
+            # The end-of-parse orphan-file check (parser.py) walks the raw
+            # `get_files()` dict and only skips an entry whose OWN identity
+            # is in `consumed_file_idents` — mark that one too, not just the
+            # stale reference we were actually given, or this still gets
+            # double-reported as an unresolved failure despite having just
+            # been attached to a page correctly.
+            consumed_file_idents.add(resolved_identity)
     if not fmeta or not fmeta.get('content'):
         return None
     filename = str(val.get('EmbeddedFileName') or '').replace('\x00', '').strip()
