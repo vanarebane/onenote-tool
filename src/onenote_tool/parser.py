@@ -27,9 +27,10 @@ from .models import ElementReport, PageRegion, PageResult
 from .ordering import _object_space_order, _page_content_order, _page_regions
 from .recovery import _flat_recover_protected_pages
 from .rendering import (
-    _RTU_MARKER, _child_ids, _color_from_bytes, _has_visible_content, _image_block_html, _list_is_ordered,
-    _media_block_html, _paragraph_alignment, _placeholder_blocks, _placeholder_run, _placeholder_text,
-    _resolve_run_format, _resolve_table_grid, _runs_to_paragraphs, _rtu_to_inline_html, _table_html,
+    _RTU_MARKER, _child_ids, _color_from_bytes, _file_embed_html, _has_visible_content, _image_block_html,
+    _list_is_ordered, _media_block_html, _paragraph_alignment, _placeholder_blocks, _placeholder_run,
+    _placeholder_text, _resolve_run_format, _resolve_table_grid, _runs_to_paragraphs, _rtu_to_inline_html,
+    _table_html,
 )
 from .stamps import _is_stamp, classify_stamp
 from .text import _clean_text, _clean_title, _extract_guid, _le_int, _norm_identity, decode_run_text
@@ -157,7 +158,10 @@ def _run_is_equation(val, by_id) -> bool:
     return bool(trf) and str((trf.get('val') or {}).get('MathFormatting', '')).lower() == 'true'
 
 
-def _build_blocks(runs, tables, images, ink_container_ids, files, by_id, used_thumb_refs, report=None) -> list:
+def _build_blocks(
+    runs, tables, images, ink_container_ids, files, by_id, used_thumb_refs,
+    order_index=None, identity_by_ref=None, report=None,
+) -> list:
     """Render one content scope (a whole page, or a single `PageRegion`) into
     `blocks` — the same builder both call, so a region's content is rendered
     identically to how it would look in the flat, whole-page `blocks` list.
@@ -166,22 +170,78 @@ def _build_blocks(runs, tables, images, ink_container_ids, files, by_id, used_th
     drawing's own converted/failed tally — passed for the whole-page call and
     omitted for each of that same page's region calls, so re-rendering the
     SAME ink drawing into a region's own blocks doesn't double-count it.
+
+    `order_index`/`identity_by_ref` are optional (both default to `{}`, degrading
+    to this function's original always-tables-first-then-text-then-images
+    behavior) — when given, they let a table (keyed directly by its own `tid`)
+    or a standalone image (via `identity_by_ref[image.ref] -> order_index`) whose
+    own document position resolves interleave with the surrounding text instead
+    of a fixed placement regardless of where it actually sat. One whose position
+    doesn't resolve (rare) still falls back to its original fixed placement, in
+    its original relative order — never dropped.
     """
     blocks = []
+    order_index = order_index or {}
+    identity_by_ref = identity_by_ref or {}
+    used_file_icon_refs = {f.icon_ref for f in files if getattr(f, 'icon_ref', None)}
+
+    def _image_block(image) -> dict:
+        return {
+            'kind': 'image', 'html': _image_block_html(image.ref),
+            'image_src': image.ref, 'width': image.width, 'height': image.height,
+        }
+
+    # A table or image whose own document position resolves interleaves with
+    # the surrounding text instead of tables always rendering before ALL
+    # text and images always trailing after ALL of it (real bugs, both
+    # verified against real pages: a table imported above the paragraph that
+    # introduced it, e.g. "Causes:"; a picture between two paragraphs
+    # imported at the very end instead of its own row in place). One whose
+    # position doesn't resolve (rare) falls back to the ORIGINAL fixed
+    # placement — tables first, images trailing — never dropped, and when
+    # NOTHING resolves this reproduces this function's pre-fix output exactly.
+    positionable = []      # (order, block_dict)
+    trailing_tables = []   # no resolvable position — original placement: first
+    trailing_images = []   # no resolvable position — original placement: after text
 
     for tid, grid in tables:
-        blocks.append({'kind': 'table', 'html': _table_html(grid, by_id.get(tid))})
-
-    if runs:
-        blocks.append({'kind': 'text', 'html': _runs_to_paragraphs(runs)})
+        block = {'kind': 'table', 'html': _table_html(grid, by_id.get(tid))}
+        table_order = order_index.get(tid)
+        (positionable if table_order is not None else trailing_tables).append((table_order, block))
 
     for image in images:
         if image.ref in used_thumb_refs:
             continue  # shown inside the YouTube embed, not as a standalone image
-        blocks.append({
-            'kind': 'image', 'html': _image_block_html(image.ref),
-            'image_src': image.ref, 'width': image.width, 'height': image.height,
-        })
+        if image.ref in used_file_icon_refs:
+            continue  # shown inside its file's own embed card, not as a standalone image
+        block = _image_block(image)
+        image_order = order_index.get(identity_by_ref.get(image.ref))
+        (positionable if image_order is not None else trailing_images).append((image_order, block))
+
+    for _, block in trailing_tables:
+        blocks.append(block)
+
+    if positionable:
+        items = [(order_index.get(r.get('rid'), 10 ** 9), 'run', r) for r in runs]
+        items += [(order, 'block', block) for order, block in positionable]
+        items.sort(key=lambda entry: entry[0])
+
+        pending_runs = []
+        for _, kind, entry in items:
+            if kind == 'run':
+                pending_runs.append(entry)
+                continue
+            if pending_runs:
+                blocks.append({'kind': 'text', 'html': _runs_to_paragraphs(pending_runs)})
+                pending_runs = []
+            blocks.append(entry)
+        if pending_runs:
+            blocks.append({'kind': 'text', 'html': _runs_to_paragraphs(pending_runs)})
+    elif runs:
+        blocks.append({'kind': 'text', 'html': _runs_to_paragraphs(runs)})
+
+    for _, block in trailing_images:
+        blocks.append(block)
 
     # Audio/video attachments get an inline HTML5 player instead of a bare
     # download link — same underlying PageFile/bytes (still uploaded via
@@ -197,10 +257,7 @@ def _build_blocks(runs, tables, images, ink_container_ids, files, by_id, used_th
         else:
             blocks.append({'kind': kind, 'html': _media_block_html(kind, f.ref), f'{kind}_src': f.ref})
     if other_files:
-        links = ''.join(
-            f'<p>\U0001F4CE <a href="{html.escape(f.ref, quote=True)}">{html.escape(f.filename)}</a></p>'
-            for f in other_files
-        )
+        links = ''.join(_file_embed_html(f.ref, f.filename, f.icon_ref) for f in other_files)
         blocks.append({'kind': 'file_links', 'html': links})
 
     if ink_container_ids:
@@ -435,13 +492,55 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
     # in which one — see `models.PageRegion` / `ordering._page_regions`.
     regions_by_page, content_region = _page_regions(props, by_id)
 
+    # Real bug found and fixed testing real pages: a run's `TextRunFormatting`
+    # -derived guid (`_run_guid`, below) is the base guid of the OUTLINE BOX
+    # (floating text area) it structurally sits in — NOT necessarily the
+    # page's own "official" identity (from `jcidPageMetaData`/
+    # `jcidPageManifestNode`). These are the SAME base guid for a page with
+    # exactly one outline box created directly, but DIFFERENT whenever a
+    # page has more than one floating box (verified against multiple real
+    # pages: every checked page's runs resolved to a base guid that did NOT
+    # match its own PageMetaData identity). Left unmapped, this silently
+    # split ONE page into several separate `PageResult`s — one per distinct
+    # outline-box guid its runs happened to carry, each secondary one
+    # showing up as its own oddly-titled or "Untitled page" entry with the
+    # REST of that same page's content — and starved `page_title_by_guid`/
+    # `regions_by_page` below (both keyed by the true page guid) of a match
+    # for the "genuine" group, since `current_guid` never equalled it
+    # either (confirmed: this is why `page.regions` came back empty for
+    # pages that structurally do have real floating-box data).
+    #
+    # `_page_regions`'s own walk (just above) already builds the correct,
+    # STRUCTURAL association between an outline box and its true page —
+    # every entry in `regions_by_page[page_guid]` names that page's own
+    # outline boxes by their full identity. Index it in reverse (an outline
+    # box's own base guid -> its true page's guid) and remap every run's
+    # resolved guid through it before grouping. Verified collision-free on
+    # every real file checked (an outline box belongs to exactly one page,
+    # never shared between two) — this isn't a "which reference wins"
+    # heuristic like the reverted 0.1.0 fix; it's recovering a mapping the
+    # file's own structure already encodes elsewhere, not guessing one.
+    outline_to_page = {}
+    for _pg, _regions in regions_by_page.items():
+        for _r in _regions:
+            outline_to_page[_r['guid'].split(',')[0]] = _pg
+
     groups = OrderedDict()  # guid -> {runs, images, files, date, time}
     image_counter = [0]
     file_counter = [0]
     consumed_file_idents = set()  # EmbeddedFileContainer identities already attached to a page
+    # Real bug fixed: unlike images (deduped by content hash — OneNote keeps
+    # a downscaled "web" copy of a pasted picture as a second node), a file
+    # attachment had NO dedup at all — a revision-duplicate EmbeddedFileNode
+    # (a different, non-stale identity, same real underlying bytes) imported
+    # as two copies of the same attachment. Exact byte equality (not a
+    # perceptual hash — files aren't re-encoded the way images sometimes
+    # are) on (filename, content) is enough here.
+    seen_file_content = set()
     current_guid = None
     image_by_key = {}        # dedup_key -> index into image_records (keep larger)
     image_records = []       # (page_guid, near_guid, PageImage) assigned after grouping
+    file_records = []        # (page_guid, near_guid, PageFile) assigned after grouping — same reasoning
     # ref (image/file placeholder token) -> the originating prop's own identity,
     # used only to look a ref up in `content_region` (see `_page_regions`) once
     # regions are computed below — kept separate from PageImage/PageFile
@@ -474,7 +573,7 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
             run_id = _norm_identity(prop.get('identity'))
             guid = _run_guid(val)
             if guid:
-                current_guid = guid
+                current_guid = outline_to_page.get(guid, guid)
             if not current_guid:
                 continue
             grp = group_for(current_guid)
@@ -574,10 +673,29 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
             # etc. attachment gets a working download link on the page even when
             # its preview is missing or an unsupported format (e.g. .emf).
             embedded_file = None
+            duplicate_file = False
             if ptype in _EMBED_TYPES and current_guid:
                 embedded_file = _build_embedded_file(val, files_by_identity, file_counter, consumed_file_idents, report)
-                if embedded_file is not None:
-                    group_for(current_guid)['files'].append(embedded_file)
+                if embedded_file is not None and (embedded_file.filename, embedded_file.data) in seen_file_content:
+                    report.fail('file_duplicate')
+                    duplicate_file = True
+                elif embedded_file is not None:
+                    seen_file_content.add((embedded_file.filename, embedded_file.data))
+                    # Real bug fixed: unlike images (which prefer a structural
+                    # PictureContainer-derived page_guid over the current_guid
+                    # "last text run seen" fallback — see below), a file used
+                    # to attach to current_guid unconditionally, no structural
+                    # check at all. current_guid is just iteration-order
+                    # position, not a real page lookup, so a file discovered
+                    # before its own page's first text run (or after another
+                    # page's) landed on the WRONG page — verified against real
+                    # notebooks: a PDF/audio/spreadsheet attachment leaking
+                    # onto an adjacent page. own_identity's own guid IS this
+                    # node's real page object-space (same fact already relied
+                    # on for page_style_by_guid/regions above) — defer
+                    # assignment the same way images do, preferring it.
+                    own_guid = (own_identity or '').split(',')[0] or None
+                    file_records.append((own_guid, current_guid, embedded_file))
                     identity_by_ref[embedded_file.ref] = own_identity
 
             # The image's PictureContainer GUID equals its page's object space,
@@ -587,12 +705,21 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
             # keep the largest resolution among duplicates. Embedded objects
             # (video/YouTube) contribute their preview picture the same way.
             image = _build_page_image(val, files_by_identity, image_counter, report)
+            if ptype in _EMBED_TYPES and embedded_file is not None and image is not None:
+                # This node's own preview picture — attach it to the file
+                # instead of letting it fall through to the generic
+                # image-records path below and show up as an unrelated
+                # standalone image block. Real gap fixed: OneNote's actual
+                # file-type icon used to land on the page disconnected from
+                # its filename/link. `_build_blocks` skips a standalone
+                # block for any ref referenced here (mirrors used_thumb_refs).
+                embedded_file.icon_ref = image.ref
             if image is None:
                 if ptype in _EMBED_TYPES:
                     # Embedded object with no extractable preview — if the real file
                     # wasn't attachable either, leave a visible marker instead of
                     # silently dropping it.
-                    if current_guid and embedded_file is None:
+                    if current_guid and embedded_file is None and not duplicate_file:
                         fname = str(val.get('EmbeddedFileName') or '').replace('\x00', '').strip()
                         desc = f'an embedded file{f" ({fname})" if fname else ""}'
                         group_for(current_guid)['runs'].append(_placeholder_run(desc, 'no preview to import'))
@@ -739,6 +866,19 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
             target = '__images_only__'
         group_for(target)['images'].append(image)
 
+    # Same preference order as images: a file's own structural page_guid
+    # wins over the current_guid fallback (see file_records' own comment).
+    for page_guid, near_guid, file in file_records:
+        if page_guid and page_guid in groups:
+            target = page_guid
+        elif near_guid and near_guid in groups:
+            target = near_guid
+        elif groups:
+            target = next(iter(groups))
+        else:
+            target = '__files_only__'
+        group_for(target)['files'].append(file)
+
     pages = []  # list of (section_order, PageResult)
     for _guid, grp in groups.items():
         runs = grp['runs']  # {'t': text, 'h': inline html or None, 'yt': {...}}
@@ -808,7 +948,8 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
         tables = grp.get('tables', [])
         files = grp.get('files', [])
         blocks = _build_blocks(
-            body_runs, tables, grp['images'], ink_container_ids, files, by_id, used_thumb_refs, report=report,
+            body_runs, tables, grp['images'], ink_container_ids, files, by_id, used_thumb_refs,
+            order_index=order_index, identity_by_ref=identity_by_ref, report=report,
         )
 
         if not blocks and not title:
@@ -836,7 +977,10 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
             r_images = [img for img in grp['images'] if content_region.get(identity_by_ref.get(img.ref)) == rguid]
             r_ink_ids = [i for i in ink_container_ids if content_region.get(i) == rguid]
             r_files = [f for f in files if content_region.get(identity_by_ref.get(f.ref)) == rguid]
-            r_blocks = _build_blocks(r_runs, r_tables, r_images, r_ink_ids, r_files, by_id, used_thumb_refs)
+            r_blocks = _build_blocks(
+                r_runs, r_tables, r_images, r_ink_ids, r_files, by_id, used_thumb_refs,
+                order_index=order_index, identity_by_ref=identity_by_ref,
+            )
             if r_blocks:
                 regions.append(PageRegion(
                     x=rmeta['x'], y=rmeta['y'], width=rmeta['width'], height=rmeta['height'], blocks=r_blocks,

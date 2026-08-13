@@ -171,6 +171,8 @@ class PageFile:
     ref: str
     data: bytes
     filename: str
+    icon_ref: str | None = None  # matches a PageImage.ref — the file's own
+                                  # preview picture, if it had one
 
 @dataclass
 class PageRegion:
@@ -240,22 +242,31 @@ self-contained, semantic HTML fragment:
 This is deliberately **not** a layout format — there is no `x`/`y`/pixel
 position anywhere on an individual block. OneNote's own pages are free-form
 canvases (users drag text/image boxes anywhere), but `blocks` doesn't try to
-reproduce that canvas: it hands you the content, in the order OneNote itself
-stores it, and leaves layout entirely to you. See `page.regions` below if
-your application wants the canvas positions themselves.
+reproduce that canvas: it hands you the content in reading order — a table
+or a standalone image whose own document position resolves is interleaved
+with the surrounding text at the spot it actually sat (e.g. above the
+paragraph that introduces it, or between two others), not forced to a fixed
+position — and leaves layout entirely to you. See `page.regions` below if
+your application wants the canvas positions themselves. (One whose position
+doesn't resolve — rare — still falls back to a fixed placement: tables
+before text, images after; never dropped.)
 
-An image/audio/video/file block's `html` (`<img src="...">` for images,
-`<audio controls src="...">`/`<video controls src="...">` for audio/video, a
-list of `<p>📎 <a href="...">name</a></p>` links for `file_links`)
+An image/audio/video block's `html` (`<img src="...">` for images,
+`<audio controls src="...">`/`<video controls src="...">` for audio/video)
 references its placeholder token (`PageImage.ref` / `PageFile.ref`, e.g.
-`"onenote-image://3"`) as the `src`/`href` — **your code is responsible for
+`"onenote-image://3"`) as the `src` — **your code is responsible for
 uploading `PageImage.data`/`PageFile.data` somewhere and substituting the
 real URL in place of that token** (a simple string replace across the
-block's `html` is enough; the token is unique per page). Audio/video
-attachments are ordinary `PageFile`s in `page.files` — there's no dedicated
-jcid for either in OneNote's format, so they're recognized by filename
-extension the same way any other attachment type without its own node shape
-would be.
+block's `html` is enough; the token is unique per page). A `file_links`
+block's `html` is one `<div class="onenote-file-embed">` per file, each
+wrapping a link (`href` = that `PageFile.ref`) around an optional icon
+(`<img class="onenote-file-icon" src="...">`, from that file's own
+`icon_ref` when it had a preview picture) and the filename — style it
+however you like, or ignore the class names and just use the link/icon
+`src` tokens directly. Audio/video attachments are ordinary `PageFile`s in
+`page.files` — there's no dedicated jcid for either in OneNote's format, so
+they're recognized by filename extension the same way any other attachment
+type without its own node shape would be.
 
 An `'ink'` block's `html` is a self-contained inline `<svg>...</svg>`
 fragment (see
@@ -443,24 +454,24 @@ Legend: ✅ complete and verified · ⚠️ partial / best-effort · ❌ not imp
 | Font size / family | ✅ (only where the run explicitly overrides the paragraph default — see below) | ⚠️ (same per-run decode ceiling as other formatting) |
 | Bulleted / numbered lists, incl. nesting | ✅ | ⚠️ (wired in; verified partial on a real file — ~47% of the objects needed for list membership and ~25% for ordered-vs-bullet decoded) |
 | Hyperlinks (standalone + inline) | ✅ | ⚠️ (mechanism is wired in, same per-run decode ceiling as formatting) |
-| Images (inline/pasted) | ✅ (real pyOneNote bug found and fixed testing a real ~250MB notebook: `get_files()` collapses multiple identities that share one underlying blob — e.g. the same photo pasted on two pages — into a single last-wins slot, silently orphaning the rest; see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) | ✅ |
-| Embedded files / attachments (non-image) | ✅ (same fix as above) | ✅ |
+| Images (inline/pasted) | ✅ (real pyOneNote bug found and fixed testing a real ~250MB notebook: `get_files()` collapses multiple identities that share one underlying blob — e.g. the same photo pasted on two pages — into a single last-wins slot, silently orphaning the rest; see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md). Also fixed: a standalone image between two paragraphs used to always trail after ALL of a page's text instead of its own row in place — now interleaved at its real position when it resolves) | ✅ |
+| Embedded files / attachments (non-image) | ✅ (same identity-collapse fix as above. Also fixed testing real notebooks: a file had no structural page lookup at all — unlike images, it attached unconditionally to whichever page's text was seen most recently while iterating, not a real page lookup, so a PDF/audio/spreadsheet could land on the wrong, usually adjacent, page; a file's own identity guid is now preferred the same way images already do. A revision-duplicate file (same content, different identity) also no longer imports as two copies — exact `(filename, content)` equality is deduped. A file's own preview picture, if it had one, is now linked to its card via `PageFile.icon_ref` instead of showing up as an unrelated standalone image) | ✅ |
 | Audio recordings | ✅ (inline `<audio>` player) | ✅ (verified against real .wav/.ogg attachments — extension classification, not page attribution, is what's proven here; a file can still land on the wrong page under the pre-existing structural-clustering spillover) |
 | Video attachments | ✅ (inline `<video>` player) | ✅ (same — verified against real .mp4/.webm/.wmv attachments) |
-| Tables | ✅ (correct cell placement; cells render with the same formatting/alignment/lists/background-color as body text — see below) | ❌ (wired in, but every `jcidTableNode` in the test file decoded to a completely empty property set — 0/6 across both protected sections tested; see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) |
+| Tables | ✅ (correct cell placement; cells render with the same formatting/alignment/lists/background-color as body text — see below; a real bug fixed testing real pages: a table used to always render before ALL of a page's text regardless of where it actually sat — e.g. above the paragraph that introduced it — `blocks` now interleaves it at its real document position when that position resolves) | ❌ (wired in, but every `jcidTableNode` in the test file decoded to a completely empty property set — 0/6 across both protected sections tested; see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) |
 | Merged table cells | ✅ (a real, undocumented-by-pyOneNote structural property found via raw property scanning — not a content heuristic; renders as real `<td colspan>`, matching the MHT ground truth — see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) | ❌ |
 | Images inside a table cell | ✅ (verified against a real cell; two real bugs — double-extraction and a cross-cell image leak — found and fixed along the way, see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) | ❌ (protected tables never decode at all — see above) |
 | Table-level styling (column widths, border visibility) | ✅ (baked into the table's own HTML as a `<colgroup>` + border styling, same inline-CSS convention as cell color/alignment; "autofit vs. fixed width" needs no separate handling — both just resolve to concrete column widths — see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) | ❌ |
 | Ink / hand-drawn drawings | ✅ | ⚠️ (collected structurally; stroke decode has the same partial-decode ceiling) |
 | YouTube embeds (thumbnail-matched) | ✅ | ⚠️ (embed itself wired in and renders correctly; thumbnail pre-matching not attempted; unverified against real decoded data — see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) |
 | Paragraph text alignment (left/center/right) | ✅ | ⚠️ (same per-run decode ceiling as other formatting) |
-| Floating-box canvas layout (`page.regions`) | ✅ (position/size per top-level content box, verified against a real 6-box page) | ❌ (tried directly against a real protected copy of that same 6-box page — the 5-level reference chain needed never decoded intact for even one page; see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) |
+| Floating-box canvas layout (`page.regions`) | ✅ (position/size per top-level content box, verified against a real 6-box page; a real bug found testing more real notebooks — a run's own guid is its OUTLINE BOX's guid, not always the page's, silently leaving `regions` empty on any page with more than one box — is now cross-referenced and fixed for every page where the file's own structure has a path to correct it; see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) | ❌ (tried directly against a real protected copy of that same 6-box page — the 5-level reference chain needed never decoded intact for even one page; see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) |
 | Page titles | ⚠️ (a renamed page can leave both its old and new title text under the same identity with no reliable signal which is current — `page_title_by_guid`'s first-occurrence-wins picks correctly on some pages, stale on others, same file; see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) | ⚠️ (commonly ~50–100% depending on the file; some titles are never recoverable at all) |
 | Page order within a section | ✅ | ⚠️ (structural file-position order used as a proxy, not verified against OneNote's own page-series order) |
 | Section groups / folders | ✅ | ✅ (comes from the `.onepkg` archive structure, unaffected by a section's own encryption) |
 | Date/time auto-stamps → page `created_at` | ✅ | ✅ |
-| Page indent level (sub-pages) | ✅ | ⚠️ (reads the same `PageLevel` property as the normal pipeline; verified recovering a real secondary-level page — bounded by the usual per-object decode ceiling, so a page whose own `PageMetaData` didn't decode still defaults to top-level) |
-| Revision-duplicate cleanup (no ghost/duplicate pages) | ✅ | ⚠️ (actively handled with a dedicated dedup pass; some spillover cases are documented, not all eliminated) |
+| Page indent level (sub-pages) | ✅ (a real bug — the same outline-box-guid-vs-page-guid mismatch as `page.regions` above — was silently resetting a page's indent to 0; fixed by the same cross-reference) | ⚠️ (reads the same `PageLevel` property as the normal pipeline; verified recovering a real secondary-level page — bounded by the usual per-object decode ceiling, so a page whose own `PageMetaData` didn't decode still defaults to top-level) |
+| Revision-duplicate cleanup (no ghost/duplicate pages) | ✅ (a real bug fixed testing a real notebook: a revision-duplicate declaration inside a table could produce an entire spurious extra *page* — not just duplicate content within one — holding a second copy of that table under a stale/"Untitled" title; the same outline-box cross-reference above merges it back into the real page. Not fully closed: an outline box with no structural path back to ANY page — not just the wrong one — still can't be recovered this way, and remains a known, documented residual case) | ⚠️ (actively handled with a dedicated dedup pass; some spillover cases are documented, not all eliminated) |
 | Embedded Office files (Excel, PDF, 3D models, generic attachments) | ✅ (no dedicated handling needed — the same generic attachment path already covering .zip/.wav/etc.; a real revision-store identity mismatch found and fixed along the way, see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) | ⚠️ (same per-object decode ceiling as everything else in a protected section) |
 | Math equations (OneNote's inline equation editor) | ⚠️ (detected and replaced with an honest placeholder — the underlying Unicode "linear format" control characters aren't laid out into a real formula, and OneNote's own MHT export doesn't do this either, it rasterizes to an image; see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) | ❌ (same detection mechanism, untested against protected content) |
 | Page background color / rule-lines pattern | ✅ (`PageResult.background_color` / `.rule_lines` — plain page-level properties, not baked into `blocks` html; rendering/visualizing them is left to the caller. Verified against 13 real pages, one per built-in pattern plus color variants — see [known limitations](https://github.com/vanarebane/onenote-tool/blob/main/docs/knowledge/known-limitations.md)) | ❌ (untested against protected content) |

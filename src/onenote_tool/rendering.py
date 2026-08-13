@@ -122,6 +122,24 @@ def _media_block_html(tag: str, ref: str) -> str:
     return f'<{tag} controls src="{src}"></{tag}>'
 
 
+def _file_embed_html(ref: str, filename: str, icon_ref) -> str:
+    """The `html` fragment for one 'file_links' entry: a neutral, self-
+    contained embedded-file card — `onenote-file-embed` wrapping an optional
+    icon picture (the node's own PictureContainer preview, see PageFile.
+    icon_ref) and the filename, both `ref`s the caller's own placeholder-
+    token contract (same as `_image_block_html`). No icon falls back to a
+    bare link — a consuming renderer without its own file-type icon still
+    gets a working download link, same as before this existed."""
+    esc = lambda v: html.escape(v, quote=True)
+    name = html.escape(filename)
+    icon = f'<img class="onenote-file-icon" src="{esc(icon_ref)}" alt="">' if icon_ref else ''
+    return (
+        f'<div class="onenote-file-embed">'
+        f'<a class="onenote-file-link" href="{esc(ref)}" target="_blank" rel="noopener noreferrer">'
+        f'{icon}<span class="onenote-file-name">{name}</span></a></div>'
+    )
+
+
 _RTU_MARKER = '﷟'  # noqa (U+FDDF hyperlink field marker in RichEditTextUnicode)
 
 # Bare URLs written as plain text (no HYPERLINK field) are auto-linked too.

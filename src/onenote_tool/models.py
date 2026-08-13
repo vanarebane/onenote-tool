@@ -42,6 +42,12 @@ class PageFile:
     ref: str          # placeholder token embedded in block html until the caller uploads it
     data: bytes       # raw file bytes
     filename: str     # original OneNote filename (shown as the download link text)
+    # A jcidEmbeddedFileNode carries its own preview picture (PictureContainer)
+    # alongside the real attached file (EmbeddedFileContainer) — when present,
+    # this is that picture's own PageImage.ref (same placeholder-token contract,
+    # already included in PageResult.images so the caller uploads it like any
+    # other image). None when the node had no extractable preview.
+    icon_ref: Optional[str] = None
 
 
 @dataclass

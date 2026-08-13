@@ -1,4 +1,4 @@
-from onenote_tool.ordering import _int, _page_regions
+from onenote_tool.ordering import _int, _page_content_order, _page_regions
 
 
 def _ident(guid: str, rev: int) -> list:
@@ -10,6 +10,89 @@ def test_int_coerces_plain_values():
     assert _int('48') == 48
     assert _int(None) == 0
     assert _int('not a number', default=7) == 7
+
+
+def test_page_content_order_includes_image_between_runs():
+    # Real bug this enables fixing (parser._build_blocks): an image node used
+    # to be walked over (to reach further children) but never itself given a
+    # position, so a caller had no way to tell it sat between these two runs
+    # rather than after both.
+    page_guid = '66666666-6666-6666-6666-666666666666'
+    run1_guid = '77777777-7777-7777-7777-777777777777'
+    image_guid = '88888888-8888-8888-8888-888888888888'
+    run2_guid = '99999999-9999-9999-9999-999999999999'
+    props = [
+        {
+            'type': 'jcidPageManifestNode',
+            'identity': _ident(page_guid, 10),
+            'val': {'ContentChildNodesOfPageManifest': _ident(page_guid, 20)},
+        },
+        {
+            'type': 'jcidPageNode',
+            'identity': _ident(page_guid, 20),
+            'val': {'ElementChildNodesOfVersionHistory': [
+                *_ident(run1_guid, 30), *_ident(image_guid, 31), *_ident(run2_guid, 32),
+            ]},
+        },
+        {'type': 'jcidRichTextOENode', 'identity': _ident(run1_guid, 30), 'val': {}},
+        {'type': 'jcidImageNode', 'identity': _ident(image_guid, 31), 'val': {}},
+        {'type': 'jcidRichTextOENode', 'identity': _ident(run2_guid, 32), 'val': {}},
+    ]
+    by_id = {}
+    for p in props:
+        by_id[f"{p['identity'][0].split('(')[1].split(')')[0].replace(' ', '')}"] = p
+
+    order, title_ids = _page_content_order(props, by_id)
+
+    assert order[f'{run1_guid},30'] == 0
+    assert order[f'{image_guid},31'] == 1
+    assert order[f'{run2_guid},32'] == 2
+    assert title_ids == set()
+
+
+def test_page_content_order_includes_table_after_intro_run_without_descending_into_it():
+    # Real bug this enables fixing: a table used to be walked over the same
+    # way (no position recorded) — always rendering before ALL page text.
+    # Its own cell/row children must NOT get their own top-level slot too
+    # (they're consumed via the table's own separate tree walk).
+    page_guid = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+    run1_guid = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+    table_guid = 'cccccccc-cccc-cccc-cccc-cccccccccccc'
+    row_guid = 'dddddddd-dddd-dddd-dddd-dddddddddddd'
+    run2_guid = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
+    props = [
+        {
+            'type': 'jcidPageManifestNode',
+            'identity': _ident(page_guid, 10),
+            'val': {'ContentChildNodesOfPageManifest': _ident(page_guid, 20)},
+        },
+        {
+            'type': 'jcidPageNode',
+            'identity': _ident(page_guid, 20),
+            'val': {'ElementChildNodesOfVersionHistory': [
+                *_ident(run1_guid, 30), *_ident(table_guid, 31), *_ident(run2_guid, 32),
+            ]},
+        },
+        {'type': 'jcidRichTextOENode', 'identity': _ident(run1_guid, 30), 'val': {}},
+        {
+            'type': 'jcidTableNode',
+            'identity': _ident(table_guid, 31),
+            'val': {'ElementChildNodesOfVersionHistory': _ident(row_guid, 40)},
+        },
+        {'type': 'jcidTableRowNode', 'identity': _ident(row_guid, 40), 'val': {}},
+        {'type': 'jcidRichTextOENode', 'identity': _ident(run2_guid, 32), 'val': {}},
+    ]
+    by_id = {}
+    for p in props:
+        by_id[f"{p['identity'][0].split('(')[1].split(')')[0].replace(' ', '')}"] = p
+
+    order, title_ids = _page_content_order(props, by_id)
+
+    assert order[f'{run1_guid},30'] == 0
+    assert order[f'{table_guid},31'] == 1
+    assert order[f'{run2_guid},32'] == 2
+    assert f'{row_guid},40' not in order
+    assert title_ids == set()
 
 
 PAGE_GUID = '11111111-1111-1111-1111-111111111111'

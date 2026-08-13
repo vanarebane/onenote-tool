@@ -130,8 +130,16 @@ def _content_child_ids(prop) -> list:
 
 def _page_content_order(props, by_id):
     """Walk each page's manifest tree in child order to recover the real visual
-    order of its text runs, and flag runs that sit under the TitleNode (the page
-    title, not body). Returns (order_index{run_id: seq}, title_run_ids)."""
+    order of its text runs AND standalone images/embedded files (own-identity
+    keyed, same `_norm_identity` space `parser.py`'s main object loop already
+    computes `own_identity` in — that's what lets a caller line an image back
+    up with its slot here), and flag runs that sit under the TitleNode (the
+    page title, not body). A picture/file's own order lets `_build_blocks`
+    interleave it with the text it actually sat next to instead of always
+    trailing every image after all the page's text (real bug, verified
+    against a real page: an image between two paragraphs imported at the very
+    end instead of its own row in place). Returns (order_index{run_id or
+    image/file identity: seq}, title_run_ids)."""
     order = {}
     title_ids = set()
     counter = [0]
@@ -145,12 +153,27 @@ def _page_content_order(props, by_id):
         if not p:
             return
         t = p.get('type', '')
-        if t in _TABLE_TYPES or t in _TABLE_PART_TYPES:
-            return  # tables + their cell runs are handled/consumed separately
+        if t in _TABLE_TYPES:
+            # The table itself gets a slot (so _build_blocks can interleave
+            # it with the text around it — real bug fixed: a table used to
+            # always render before ALL page text regardless of where it
+            # actually sat, e.g. above a "Causes:" label that introduced it).
+            # Its rows/cells are walked/rendered separately, not through here.
+            if not in_title and nid not in order:
+                order[nid] = counter[0]
+                counter[0] += 1
+            return
+        if t in _TABLE_PART_TYPES:
+            return  # cells/rows: consumed via the table's own tree walk elsewhere
         if t == 'jcidRichTextOENode':
             if in_title:
                 title_ids.add(nid)
             elif nid not in order:
+                order[nid] = counter[0]
+                counter[0] += 1
+            return
+        if t in _IMAGE_TYPES or t in _EMBED_TYPES:
+            if not in_title and nid not in order:
                 order[nid] = counter[0]
                 counter[0] += 1
             return

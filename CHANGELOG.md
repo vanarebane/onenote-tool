@@ -4,6 +4,64 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/); versions match
 `pyproject.toml`.
 
+## [0.1.4] - 2026-08-14
+
+### Added
+- `PageFile.icon_ref` — a `jcidEmbeddedFileNode`'s own preview picture
+  (`PictureContainer`) is now linked to its real attached file
+  (`EmbeddedFileContainer`) instead of surfacing as an unrelated standalone
+  image block. `_build_blocks`'s `'file_links'` entries render as a neutral
+  `onenote-file-embed` card (icon + filename) instead of a bare paperclip
+  emoji + link.
+
+### Fixed
+- **Real bug**: a standalone image sitting between two paragraphs always
+  imported trailing after ALL of the page's text instead of its own row in
+  place — `PageResult.blocks`/each `PageRegion`'s own blocks never tracked
+  an image's true document position relative to the surrounding text runs.
+  `ordering._page_content_order` now also assigns a position to
+  `jcidImageNode`/`jcidEmbeddedFileNode` nodes (previously walked over but
+  never given a slot), and `parser._build_blocks` interleaves a
+  position-resolved image with the text around it. An image whose position
+  doesn't resolve still falls back to the original trailing behavior.
+- **Real bug**: a table always rendered before ALL of a page's text,
+  regardless of where it actually sat (e.g. above the "Causes:" paragraph
+  that introduced it). `_page_content_order` now assigns the table node
+  itself a position too (its rows/cells are still consumed separately, not
+  walked into), and `_build_blocks` interleaves it the same way as images.
+- **Real bug**: an attachment (file/audio/video) had no structural page
+  lookup at all — unlike images (which prefer a `PictureContainer`-derived
+  page GUID), a file attached unconditionally to `current_guid` ("whichever
+  page's text was seen most recently while iterating"), which is iteration
+  order, not a real page lookup. Verified against real notebooks: a
+  PDF/audio/spreadsheet attachment landing on the wrong (usually adjacent)
+  page. Files now defer assignment the same way images do, preferring the
+  file node's own identity GUID (its real page object-space).
+- **Real bug**: a revision-duplicate `EmbeddedFileNode` (a different,
+  non-stale identity pointing at byte-identical content) imported as two
+  copies of the same attachment — files had no dedup at all, unlike images
+  (deduped by content hash). Exact `(filename, content)` equality now drops
+  the duplicate.
+- **Real, wide-reaching bug**: a text run's own resolved guid (the
+  mechanism every page-grouping decision is built on) is the guid of the
+  OUTLINE BOX it structurally sits in, not always the page's own
+  "official" identity — the same for a page with one outline box, but
+  different for any page with more than one. Verified on real files: this
+  was causing empty `page.regions` on pages that structurally do have
+  real floating-box data, `sub_level` silently resetting to 0, and — most
+  seriously — a page silently splitting into two `PageResult`s, with a
+  secondary outline box's content showing up as its own spurious,
+  oddly-titled or "Untitled page" entry. Fixed by indexing
+  `ordering._page_regions`'s own already-computed outline-to-page
+  association in reverse and remapping every run's guid through it before
+  grouping — a real structural cross-reference recovered from data this
+  tool already builds, verified collision-free, not a heuristic. Full
+  before/after content diff on every bundled test file: identical output
+  except the one intentional, verified-correct fix (a spurious duplicate
+  page merging back into its real one). See
+  `docs/knowledge/known-limitations.md` for what this does and doesn't
+  close.
+
 ## [0.1.3] - 2026-08-13
 
 ### Added

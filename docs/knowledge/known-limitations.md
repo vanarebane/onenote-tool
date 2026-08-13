@@ -154,6 +154,73 @@ guessed at — `SectionResult.name` may not always exactly match a section's
 true display name when it contains punctuation `expand.exe`/CAB
 extraction treats as filesystem-special.
 
+## A run's own guid is an outline-box guid, not always the page's — real, wide-reaching bug found and fixed
+
+Found triaging a large batch of real-notebook bugs a user reported after
+using this tool for real (misplaced pages, empty `page.regions`, pages
+that split in two, an image trailing far from where it actually sat).
+Root cause, traced back to one place: `_run_guid` (the mechanism EVERY
+page-grouping decision in `parser.py` is built on) resolves a text run's
+`TextRunFormatting` reference to a base guid — and that guid is the base
+guid of the **outline box** (floating text area) the run structurally
+sits in, not necessarily the page's own "official" identity from
+`jcidPageMetaData`/`jcidPageManifestNode`. These are the SAME base guid
+for a page with exactly one outline box created directly (the common
+case, which is why this went unnoticed through extensive earlier
+testing) — but DIFFERENT whenever a page has more than one floating box,
+which turns out to include cases created by perfectly ordinary editing
+(revision-duplicate outline declarations, multi-box layouts, pages with
+a table plus body text in separate boxes).
+
+Verified on real files: **every** page checked in a real notebook had at
+least one run whose own resolved guid did NOT match its page's
+`jcidPageMetaData` identity. Left unmapped, this had several real,
+independently-reported symptoms, all traced to this one cause:
+
+- `page.regions` came back empty for pages that structurally DO have real
+  floating-box data — `regions_by_page`/`page_title_by_guid` are both
+  keyed by the true page guid, and `current_guid` (from `_run_guid`)
+  simply never equalled it for these pages.
+- A page's `sub_level` (indent) silently reset to 0 for the same reason —
+  `page_level_by_guid` is keyed the same way.
+- Worse: a page could **silently split into two** — a run in a
+  secondary outline box became its own separate `PageResult`, showing up
+  as a spurious, oddly-titled or "Untitled page" entry holding content
+  that visually belongs to the FIRST page. Confirmed on a real notebook
+  page: an "ESP32 WiFi radar" page converted to 0 blocks while a
+  neighboring "Untitled page" held its actual YouTube embed.
+- Confirmed on the bundled test notebook: a revision-duplicate
+  declaration of a real table produced an entire spurious extra page
+  ("Untitled page") holding a full second copy of that table.
+
+Fixed in `parser.py`: `ordering._page_regions`'s own walk (already
+computed, for `page.regions` itself) already builds the correct,
+STRUCTURAL association between an outline box and its true page — every
+entry in `regions_by_page[page_guid]` names that page's own outline boxes
+by their full identity. Index it in reverse (an outline box's own base
+guid -> its true page's guid) and remap every run's resolved guid through
+it before grouping. Verified collision-free on every real file checked —
+an outline box belongs to exactly one page, never shared between two, so
+this is recovering a mapping the file's own structure already encodes
+elsewhere, not a "which reference wins" guess like the reverted 0.1.0
+"sibling consensus" fix documented above. Verified with a full
+before/after content diff on every bundled test file: page/block counts
+identical except for the one intentional, verified-correct merge (the
+spurious "Untitled page" table duplicate, above) — no other regressions
+found.
+
+**Not fully closed by this fix**: a run/outline box whose own structural
+path back to ANY page is missing entirely (not just to the WRONG page —
+genuinely absent from `_page_regions`'s own walk too) has no signal this
+mapping can recover, since there's nothing to index. Confirmed still
+present on real files after this fix (the "2020-03-22" spurious page
+in the bundled test notebook, holding scattered table-cell fragments; the
+"ESP32 WiFi radar"/"Untitled page" split above specifically). This is a
+deeper case of the same revision-store duplication family documented at
+the top of this file — not attempted further for the same standing
+reason: no verified, non-guessing signal was found to close it, and this
+project doesn't land page-attribution fixes without one.
+
 ## `pyOneNote` is version-pinned, not `>=`
 
 `pyproject.toml` pins `pyOneNote==0.0.2` exactly. This package's
