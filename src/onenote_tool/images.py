@@ -52,7 +52,12 @@ def _image_dhash(data: bytes) -> Optional[int]:
     """64-bit difference hash of an image, or None if it can't be decoded."""
     try:
         from PIL import Image
-        im = Image.open(io.BytesIO(data)).convert('L').resize((9, 8))
+        # RGBA first, then L: a paletted image with transparency converted
+        # straight to 'L' triggers a Pillow deprecation warning (a future
+        # version will stop implicitly compositing it) — compositing
+        # through RGBA first is the well-defined path either way. Only
+        # affects this perceptual hash, never the stored image bytes.
+        im = Image.open(io.BytesIO(data)).convert('RGBA').convert('L').resize((9, 8))
         px = list(im.getdata())
         bits = 0
         k = 0

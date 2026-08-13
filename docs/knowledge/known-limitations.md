@@ -34,6 +34,21 @@ visible placeholder — so a conversion never silently drops something
 without a trace. See [Documentation.md](../Documentation.md)'s progress
 table for exactly what's supported today.
 
+**A real gap in that guarantee, found and fixed testing a real notebook**: a
+plain pasted picture (a bare `jcidImageNode`, not an embedded-file's
+preview thumbnail) in a format this tool can't decode — no rasterizer here
+for e.g. `.emf`/`.xps` — used to just vanish with no trace at all on the
+page itself. `report.failed` DID correctly tally it (`image_ext.emf`,
+etc.), but nothing was ever left where the picture used to be — the
+placeholder path only ever covered an embedded-file's missing preview, not
+this case. Fixed: `parser.py`'s image-handling branch now leaves the same
+kind of visible placeholder run either way. Verified on the real notebook:
+10 real pasted EMF/XPS images that used to leave nothing now show a
+placeholder; the other 23 `image_ext.*` failures found there are
+genuinely-cosmetic embedded-file preview misses (the real attached file
+itself already succeeded and shows up as a download link — no placeholder
+needed, nothing lost).
+
 ## `pyOneNote` is version-pinned, not `>=`
 
 `pyproject.toml` pins `pyOneNote==0.0.2` exactly. This package's
@@ -79,6 +94,26 @@ unprotected pipeline too, via `page_title_by_guid`'s title dedup:
   needed the *first* occurrence, not the last) was found on the same test
   file this was investigated against, ruling out a blind
   first-wins-to-last-wins flip.
+- **Still open, confirmed at real scale**: a page's own text runs can carry
+  a `TextRunFormatting` reference pointing at a DIFFERENT page's guid
+  entirely (not just a stale revision of their own page) — the run's text
+  is correctly extracted, just grouped under the wrong page. Confirmed on a
+  real ~250MB notebook: a page whose own heading read "Bugs" (a real
+  checklist of "To Do"-tagged bug reports, verified present in the
+  notebook's own MHT export) converted to **zero body blocks** — every one
+  of its checklist items had a `TextRunFormatting` pointing at a
+  *different, unrelated* page's guid, and duplicate declarations of the
+  exact same run identity resolved to two DIFFERENT guids (one self,
+  one foreign) depending on which revision-duplicate got processed. The
+  content isn't lost — it lands on the OTHER page instead (verified: a
+  page titled "ToDo" absorbed checklist items whose own text visibly
+  belongs to several different, separately-titled pages, "Power" among
+  them) — but the per-page split is wrong. This is the exact "sibling
+  consensus" shape 0.1.0 tried and broke worse (below) — no fix attempted
+  here for the same reason: don't guess at cross-page attribution without
+  a verified, non-regressing signal. A page converting to an unexpectedly
+  low block count with a plausible-looking title is the practical symptom
+  to watch for if this needs revisiting.
 
 **Tried and reverted (0.1.1): a "sibling consensus" run-grouping override.**
 An earlier version of this package (0.1.0) had `parser.parse_one_file` build

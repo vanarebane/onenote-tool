@@ -588,13 +588,28 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
             # (video/YouTube) contribute their preview picture the same way.
             image = _build_page_image(val, files_by_identity, image_counter, report)
             if image is None:
-                # Embedded object with no extractable preview — if the real file
-                # wasn't attachable either, leave a visible marker instead of
-                # silently dropping it.
-                if ptype in _EMBED_TYPES and current_guid and embedded_file is None:
-                    fname = str(val.get('EmbeddedFileName') or '').replace('\x00', '').strip()
-                    desc = f'an embedded file{f" ({fname})" if fname else ""}'
-                    group_for(current_guid)['runs'].append(_placeholder_run(desc, 'no preview to import'))
+                if ptype in _EMBED_TYPES:
+                    # Embedded object with no extractable preview — if the real file
+                    # wasn't attachable either, leave a visible marker instead of
+                    # silently dropping it.
+                    if current_guid and embedded_file is None:
+                        fname = str(val.get('EmbeddedFileName') or '').replace('\x00', '').strip()
+                        desc = f'an embedded file{f" ({fname})" if fname else ""}'
+                        group_for(current_guid)['runs'].append(_placeholder_run(desc, 'no preview to import'))
+                elif current_guid:
+                    # A plain pasted picture (not an embedded-file's preview) in
+                    # a format this tool can't decode (e.g. .emf/.xps — no
+                    # rasterizer here) or whose bytes genuinely weren't found.
+                    # Real bug found and fixed testing a real notebook: this
+                    # used to just `continue` with NO trace left at all —
+                    # `_build_page_image` already calls `report.fail(...)`,
+                    # but that's a diagnostic tally, not something a reader of
+                    # the converted page ever sees.
+                    ident = _extract_guid(val.get('PictureContainer'))
+                    ext = (files_by_identity.get(ident) or {}).get('extension') or ''
+                    fname = str(val.get('ImageFilename') or '').replace('\x00', '').strip()
+                    desc = f'an image{f" ({fname})" if fname else f" ({ext})" if ext else ""}'
+                    group_for(current_guid)['runs'].append(_placeholder_run(desc, 'unsupported format or missing data'))
                 continue
             gm = _GUID_RE.search(str(val.get('PictureContainer', '')))
             page_guid = gm.group(1) if gm else None
