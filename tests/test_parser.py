@@ -139,3 +139,39 @@ def test_build_blocks_table_with_unresolved_order_falls_back_to_original_placeme
     blocks = _build_blocks(runs, [('table-1', grid)], [], [], [], {}, set())
 
     assert [b['kind'] for b in blocks] == ['table', 'text']
+
+
+def test_build_blocks_skips_cell_image_refs_from_standalone_rendering():
+    # Real bug, verified against a real table ("Ape image" cell): a picture
+    # pasted directly into a table cell rendered correctly inline in the
+    # cell's own HTML AND, separately, as its own standalone 'image' block —
+    # grp['images'] legitimately keeps including cell images (page.images'
+    # own total relies on it), so _build_blocks needs its own skip, same
+    # shape as used_thumb_refs/used_file_icon_refs.
+    runs = [{'t': 'paragraph', 'h': None, 'rid': 'r1'}]
+    cell_image = PageImage(ref='cell-img-ref', data=b'', ext='.png', width=10, height=10)
+    grid = [[{'html': '<img src="onenote-image://cell-img-ref">'}]]
+
+    blocks = _build_blocks(
+        runs, [('table-1', grid)], [cell_image], [], [], {}, set(),
+        used_cell_image_refs={'cell-img-ref'},
+    )
+
+    kinds = [b['kind'] for b in blocks]
+    assert 'image' not in kinds
+    assert kinds == ['table', 'text']
+
+
+def test_build_blocks_audio_file_icon_still_renders_as_standalone_image():
+    # Real regression fixed: an audio/video attachment's own preview picture
+    # was being suppressed the same way a 'file' kind's icon is (shown
+    # inside its embed card) — but _media_block_html (the audio/video
+    # player) never renders that icon anywhere, so the picture just vanished
+    # off the page entirely.
+    icon = PageImage(ref='icon-ref', data=b'', ext='.png', width=10, height=10)
+    audio_file = PageFile(ref='audio-ref', data=b'x', filename='clip.mp3', icon_ref='icon-ref')
+
+    blocks = _build_blocks([], [], [icon], [], [audio_file], {}, set())
+
+    kinds = [b['kind'] for b in blocks]
+    assert kinds == ['image', 'audio']

@@ -160,7 +160,7 @@ def _run_is_equation(val, by_id) -> bool:
 
 def _build_blocks(
     runs, tables, images, ink_container_ids, files, by_id, used_thumb_refs,
-    order_index=None, identity_by_ref=None, report=None,
+    order_index=None, identity_by_ref=None, report=None, used_cell_image_refs=None,
 ) -> list:
     """Render one content scope (a whole page, or a single `PageRegion`) into
     `blocks` — the same builder both call, so a region's content is rendered
@@ -183,7 +183,19 @@ def _build_blocks(
     blocks = []
     order_index = order_index or {}
     identity_by_ref = identity_by_ref or {}
-    used_file_icon_refs = {f.icon_ref for f in files if getattr(f, 'icon_ref', None)}
+    used_cell_image_refs = used_cell_image_refs or set()
+    # Real bug fixed: this used to include EVERY file's icon_ref regardless
+    # of how the file itself renders. An audio/video attachment's own icon
+    # never shows anywhere (_media_block_html is a bare player, no icon) —
+    # only a 'file' kind gets the icon-in-card treatment (_file_embed_html)
+    # — so suppressing an audio/video file's preview here as "shown inside
+    # its file's own embed card" was simply wrong: it isn't shown ANYWHERE,
+    # the picture just vanished. Confirmed on a real page exercising mixed
+    # embed types: every preview picture disappeared, not just file icons.
+    used_file_icon_refs = {
+        f.icon_ref for f in files
+        if getattr(f, 'icon_ref', None) and _attachment_kind(os.path.splitext(f.filename)[1]) == 'file'
+    }
 
     def _image_block(image) -> dict:
         return {
@@ -214,6 +226,8 @@ def _build_blocks(
             continue  # shown inside the YouTube embed, not as a standalone image
         if image.ref in used_file_icon_refs:
             continue  # shown inside its file's own embed card, not as a standalone image
+        if image.ref in used_cell_image_refs:
+            continue  # already rendered inline inside its table cell, not as a standalone image
         block = _image_block(image)
         image_order = order_index.get(identity_by_ref.get(image.ref))
         (positionable if image_order is not None else trailing_images).append((image_order, block))
@@ -555,11 +569,25 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
     # picture, two ref tokens, same bytes. `image_records` entries whose
     # identity ends up in here are dropped before page assignment below.
     cell_image_idents = set()
+    # A cell image's own ref, separately from `cell_image_idents` (keyed by
+    # object identity, used only for the `image_records` filter below) —
+    # `_build_blocks` needs the REF to skip it from ALSO becoming a
+    # standalone trailing image block. Real bug found and fixed: a picture
+    # pasted directly into a table cell rendered correctly inline in the
+    # table's own HTML (`_resolve_cell_html`) AND, separately, as its own
+    # standalone 'image' block — `grp['images']` legitimately needs to keep
+    # including cell images (page.images' own total already relied on this),
+    # but `_build_blocks`'s trailing-image loop had no way to know a given
+    # ref was already rendered inline elsewhere. Confirmed on a real table
+    # ("Ape image" cell): the same `onenote-image://` ref appeared both
+    # inside the cell's `<img>` and as a separate stray block.
+    used_cell_image_refs = set()
 
     def _cell_image_builder(nid, val):
         image = _build_page_image(val, files_by_identity, image_counter, report)
         if image is not None:
             cell_image_idents.add(nid)
+            used_cell_image_refs.add(image.ref)
         return image
 
     def group_for(guid):
@@ -674,7 +702,17 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
             # its preview is missing or an unsupported format (e.g. .emf).
             embedded_file = None
             duplicate_file = False
-            if ptype in _EMBED_TYPES and current_guid:
+            if ptype in _EMBED_TYPES:
+                # Real bug fixed: this used to also require current_guid
+                # truthy — a leftover from when a file attached directly to
+                # group_for(current_guid) at extraction time (needed a valid
+                # key). Now that assignment defers and prefers the file's own
+                # structural page_guid (see below), current_guid isn't needed
+                # to extract at all — file_records/the assignment loop handle
+                # a None near_guid safely. Confirmed on a real page: content
+                # (a video's real file) starting the page with no preceding
+                # text run never had a current_guid yet, so it silently
+                # extracted nothing at all — page imported completely empty.
                 embedded_file = _build_embedded_file(val, files_by_identity, file_counter, consumed_file_idents, report)
                 if embedded_file is not None and (embedded_file.filename, embedded_file.data) in seen_file_content:
                     report.fail('file_duplicate')
@@ -950,6 +988,7 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
         blocks = _build_blocks(
             body_runs, tables, grp['images'], ink_container_ids, files, by_id, used_thumb_refs,
             order_index=order_index, identity_by_ref=identity_by_ref, report=report,
+            used_cell_image_refs=used_cell_image_refs,
         )
 
         if not blocks and not title:
@@ -980,6 +1019,7 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
             r_blocks = _build_blocks(
                 r_runs, r_tables, r_images, r_ink_ids, r_files, by_id, used_thumb_refs,
                 order_index=order_index, identity_by_ref=identity_by_ref,
+                used_cell_image_refs=used_cell_image_refs,
             )
             if r_blocks:
                 regions.append(PageRegion(

@@ -143,9 +143,8 @@ def _page_content_order(props, by_id):
     order = {}
     title_ids = set()
     counter = [0]
-    seen = set()
 
-    def walk(nid, in_title):
+    def walk(nid, in_title, seen):
         if not nid or nid in seen:
             return
         seen.add(nid)
@@ -179,11 +178,24 @@ def _page_content_order(props, by_id):
             return
         deeper = in_title or (t in _TITLE_TYPES)
         for child in _content_child_ids(p):
-            walk(child, deeper)
+            walk(child, deeper, seen)
 
     for p in props:
         if p.get('type', '') == 'jcidPageManifestNode':
-            walk(_norm_identity(p.get('identity')), False)
+            # Fresh `seen` per page: real bug, verified — a node reachable
+            # (via a stale/duplicate reference) from more than one page's
+            # manifest tree used to get marked seen on its FIRST visit only.
+            # If that first visit happened in a non-order-assigning context
+            # (e.g. under an unrelated page's TitleNode), the node's real,
+            # later visit as body content on its actual page returned
+            # immediately at the `nid in seen` check and never got an order
+            # slot at all — landing on the `10**9` trailing fallback in
+            # `_build_blocks` (a header rendering after a list that
+            # structurally follows it, confirmed via a synthetic repro
+            # mirroring `test_ordering.py`'s outline/page-guid sharing
+            # tests). `order`'s own `nid not in order` guard still prevents
+            # a value from being overwritten once genuinely set.
+            walk(_norm_identity(p.get('identity')), False, set())
     return order, title_ids
 
 

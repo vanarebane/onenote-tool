@@ -4,7 +4,7 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/); versions match
 `pyproject.toml`.
 
-## [0.1.4] - 2026-08-14
+## [0.1.5] - 2026-08-14
 
 ### Added
 - `PageFile.icon_ref` — a `jcidEmbeddedFileNode`'s own preview picture
@@ -15,6 +15,54 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions match
   emoji + link.
 
 ### Fixed
+- **Real bug**: a header could render AFTER a list that structurally
+  followed it on the same page. `ordering._page_content_order`'s
+  `seen`/`order` tracking was shared across every page-manifest root in
+  the file rather than reset per page — a node whose first visit (from
+  anywhere in the file, e.g. a stale/duplicate reference from an unrelated
+  page's title) happened in a non-order-assigning context permanently lost
+  its chance to ever get one, even on its own real page later. Verified
+  with a synthetic repro before fixing (not assumed) — see
+  `docs/knowledge/known-limitations.md`.
+- **Real bug**: a picture pasted directly into a table cell rendered
+  correctly inline AND, separately, as its own stray standalone image
+  block. `_build_blocks` now skips a ref already rendered inline via a
+  cell, same shape as the existing YouTube-thumbnail/file-icon skip.
+- **Real bug**: an image's reported width was capped at 600px with no
+  proportional height rescale, both shrinking AND distorting real content —
+  confirmed against a real embedded PDF preview (OneNote's own MHT export:
+  793x1122; this tool: 600x1122). Fixed the distortion, and separately
+  raised the cap itself (600 -> 4000) after confirming with TWO independent
+  real ground-truth checks that OneNote's stored display-size properties
+  are trustworthy, not something that needed shrinking to "a typical size."
+- **Real bug**: a paragraph-level font size (e.g. a citation-style
+  paragraph's real 9pt vs. an ordinary paragraph's 11pt) could be silently
+  dropped when no per-run override existed — confirmed against a real page,
+  cross-checked pixel-for-pixel against OneNote's own MHT export.
+  `_resolve_run_format` now reads font size/family from `ParagraphStyle` as
+  the base (same pattern as bold/italic/color/highlight), with
+  `TextRunFormatting` still overriding when present. Every paragraph now
+  carries an explicit font-size/font-family span, matching what OneNote's
+  own MHT export actually does — verified crash-free, unchanged page/block
+  counts across every bundled test file and two large real notebooks.
+- Investigated, confirmed NOT bugs in this repo (see
+  `docs/knowledge/known-limitations.md`): two-column layouts collapsing to
+  one, and multiple images stacking at identical coordinates — both
+  `ordering._page_regions`/`_page_content_order` already resolve correctly
+  on real multi-box/multi-image pages; a real table's row count also
+  matches OneNote's own MHT export exactly on the case checked.
+- **Real bug**: `.onepkg` sections/section-groups unpacked in plain
+  alphabetical order — never matched OneNote's own sidebar order.
+  `convert._toc_order` recovers the real order from each folder's own
+  `Open Notebook.onetoc2` (a real, previously-undocumented binary shape,
+  reverse-engineered and verified against a real notebook's screenshot —
+  pyOneNote has no parser for this file's node type at all). Also fixes a
+  related bug found verifying it: a non-ASCII section name decodes
+  correctly from `.onetoc2` but the on-disk filename CAB extraction
+  produces for it is mojibake'd, so the order lookup was silently missing
+  and sorting those sections last — now indexed under both forms. See
+  `docs/knowledge/known-limitations.md` for the one residual case
+  (group-vs-group mutual order) this doesn't close.
 - **Real bug**: a standalone image sitting between two paragraphs always
   imported trailing after ALL of the page's text instead of its own row in
   place — `PageResult.blocks`/each `PageRegion`'s own blocks never tracked

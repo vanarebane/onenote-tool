@@ -80,11 +80,7 @@ def test_font_size_pt_zero_or_missing_is_none():
     assert _font_size_pt(None) is None
 
 
-def test_resolve_run_format_font_size_only_from_trf_override():
-    # OneNote only ever writes FontSize onto TextRunFormatting when a run's
-    # size differs from the paragraph's own default (ParagraphStyle) — that
-    # default itself should NOT surface as a per-run override (see
-    # rendering._resolve_run_format's docstring/comment).
+def test_resolve_run_format_font_size_trf_overrides_paragraph_default():
     guid = '11111111-1111-1111-1111-111111111111'
     ps_ref = [f'<ExtendedGUID> ({guid}, 1)']
     trf_ref = [f'<ExtendedGUID> ({guid}, 2)']
@@ -96,7 +92,19 @@ def test_resolve_run_format_font_size_only_from_trf_override():
     assert fmt['font_size'] == 12
 
 
-def test_resolve_run_format_no_trf_override_leaves_font_size_unset():
+def test_resolve_run_format_no_trf_override_falls_back_to_paragraph_font_size():
+    # Real bug, verified against a real page (Test/Rich content/"Section
+    # page 1"): a 'cite'-styled paragraph's own genuinely-different FontSize
+    # (9pt vs. an ordinary body paragraph's 11pt) lives ONLY on
+    # ParagraphStyle, with no TextRunFormatting override at all — since the
+    # run's real size already equals its OWN paragraph's default, OneNote
+    # correctly wrote no per-run override. Reading font size/family ONLY
+    # from TextRunFormatting (the old behavior this replaces) silently lost
+    # that distinguishing size. OneNote's own MHT export confirms every
+    # paragraph carries an explicit font-size, not just "special" ones, so
+    # ParagraphStyle's own FontSize/Font is now the base (same pattern as
+    # bold/italic/color/highlight below), with TextRunFormatting still
+    # overriding when it differs.
     guid = '22222222-2222-2222-2222-222222222222'
     ps_ref = [f'<ExtendedGUID> ({guid}, 1)']
     trf_ref = [f'<ExtendedGUID> ({guid}, 2)']
@@ -105,7 +113,7 @@ def test_resolve_run_format_no_trf_override_leaves_font_size_unset():
         f'{guid},2': {'val': {}},
     }
     fmt = _resolve_run_format(ps_ref, trf_ref, by_id)
-    assert fmt['font_size'] is None
+    assert fmt['font_size'] == 11
     assert fmt['font_family'] is None
     assert fmt['bold'] is True
 

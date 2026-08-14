@@ -154,6 +154,200 @@ guessed at — `SectionResult.name` may not always exactly match a section's
 true display name when it contains punctuation `expand.exe`/CAB
 extraction treats as filesystem-special.
 
+**Root cause pinned down (still not fixed — same reasoning as above still
+applies).** A hex dump of the SOURCE `.onepkg`'s own `Open Notebook
+.onetoc2` bytes (not anything either extraction tool produces) shows the
+name field already reads `Skills` + `5e 00 4a 00` (`^` U+005E, `J`
+U+004A, literal two-character `^J`, NOT a control character — a real line
+feed would be `0a 00`) + ` Tools.one` — confirmed at the exact byte
+offset, both before and after CAB extraction, identical either way. This
+is baked into the notebook file Microsoft's own OneNote client produced,
+not something `expand.exe`/`cabextract`/this package introduces or could
+safely guess a fix for — same "one observed example, no safe un-escaping
+rule" reasoning as above, now with a confirmed origin instead of an
+unknown one. `convert.unpack_onepkg`'s section-order fix (below) matches
+this section by its corrupted on-disk name, same as any other section —
+ordering is unaffected by the corruption, only the display name is.
+
+## Several real, lower-priority bugs found and fixed testing real notebooks
+
+A batch of smaller real bugs, each found by cross-checking this tool's
+output against OneNote's own MHT export or a real notebook's structure,
+verified before landing (not assumed):
+
+**A cell image duplicated as a stray standalone image.** A picture pasted
+directly into a table cell rendered correctly inline in the cell's own HTML
+AND, separately, as its own trailing standalone `image` block — confirmed
+on a real table (an "Ape image" cell). Root cause: `grp['images']`
+(parser.py) legitimately needs to keep including cell images (`page.images`'
+own total relies on it, and that part was already correct), but
+`_build_blocks`'s trailing-image loop had no way to know a given ref was
+already rendered inline elsewhere — unlike the existing `used_thumb_refs`/
+`used_file_icon_refs` skip mechanism, nothing equivalent existed for cell
+images. Fixed with a matching `used_cell_image_refs` skip set, built
+alongside the existing `cell_image_idents` tracking in `_cell_image_builder`.
+
+**Images could import both smaller than OneNote's own display size AND
+visibly distorted.** `images._build_page_image` capped a displayed image's
+reported `width` at `_MAX_IMAGE_DISPLAY_WIDTH` (600px, "a judgment call
+inherited unchanged from the tool this package was extracted from," never
+verified against real data) but left `height` at the real, uncapped stored
+value — distorting the aspect ratio. Confirmed on a real embedded PDF
+preview: OneNote's own MHT export renders it at 793x1122 (its real, stored
+`LayoutMaxWidth`/`LayoutMaxHeight`, confirmed matching pixel-for-pixel);
+this tool reported 600x1122, both too narrow AND squished. Fixed the
+distortion by rescaling `height` proportionally whenever `width` gets
+capped (matching what `recovery.py`'s two sibling image-sizing call sites
+already did correctly). Separately, verified the cap itself was too low
+for legitimate content, not just for this one case: a second, different
+real notebook's plain pasted photo has a genuine, correctly-stored
+`LayoutMaxWidth`/`Height` of 972x1258 (again confirmed matching OneNote's
+own MHT export exactly) — two independent, different-content-type real
+checks with **zero discrepancy** between the stored property and OneNote's
+real display size. That's evidence the property is trustworthy, not
+evidence it needs shrinking to "a typical size" — real notebooks routinely
+store `LayoutMaxWidth` up to ~2400px for ordinary pasted screenshots.
+Raised `_MAX_IMAGE_DISPLAY_WIDTH` to 4000, now a genuine safety-net ceiling
+against a pathological stored value rather than a guess at "normal" size.
+
+**A paragraph-level font size could be silently dropped.** A citation-style
+paragraph's own, genuinely different `FontSize` (a real 9pt vs. an ordinary
+body paragraph's 11pt) lives only on `ParagraphStyle`, with no
+`TextRunFormatting` override — since the run's real size already equals
+its own paragraph's default, OneNote correctly writes no per-run override.
+`rendering._resolve_run_format` used to read font size/family ONLY from
+`TextRunFormatting`, on the theory (see the superseded comment this
+replaces) that `ParagraphStyle`'s own copy is always just "the same boring
+page-wide default" not worth surfacing — disproven by real data: OneNote's
+own MHT export puts an explicit `font-size`/`font-family` on literally
+EVERY paragraph's own `<p style=...>`, not just distinctively-styled ones.
+Confirmed on a real page (Test/Rich content/"Section page 1"): a `cite`-
+styled citation line ("From <https://www.lipsum.com/>") imported with no
+font-size at all, same visual size as surrounding 11pt body text, when
+OneNote itself renders it noticeably smaller (9pt) and in gray. Fixed by
+reading `ParagraphStyle`'s own `FontSize`/`Font` as the base value (same
+pattern already used for bold/italic/color/highlight in this function),
+with `TextRunFormatting`'s own override still taking precedence when
+present. Verified: the citation line now matches OneNote's MHT export
+exactly (`font-size:9pt;font-family:Calibri`), and a 4-page real "Font
+sizes" test (11pt/12pt/36pt/9pt) still resolves every size correctly
+post-fix, cross-checked against the same MHT ground truth. This is a
+broad-blast-radius change — every paragraph now carries an explicit
+font-size/font-family span, not just ones that differ from a page's most
+common size — deliberately, since that's what the real ground truth does;
+verified crash-free and with unchanged page/block counts across every
+bundled test file and two large real notebooks (Test.onepkg, DIY.onepkg).
+
+**"Two-column layout collapsing to one column" and "images stacking at
+identical (x,y)" — investigated, NOT a bug in this repo.** Both were
+explicitly flagged for investigation but don't reproduce here:
+`ordering._page_regions` correctly detects multiple independent floating
+boxes on real multi-column/multi-box pages (verified: a real 2-column
+bulleted/numbered list page resolves to 2 distinct regions at different
+x-offsets; a real "GBA cartridge" page resolves to 5). Separately,
+`ordering._page_content_order` gives 3 real stacked images on one page 3
+genuinely distinct, correctly-ordered `order_index` values — no collision.
+If a consuming application still renders these as one column or
+overlapping images, that's downstream — either it's using the flat
+`page.blocks` view (deliberately reading-order-only, see
+[Documentation.md](../Documentation.md)) instead of `page.regions` for a
+page that has real floating-box structure, or its own layout code isn't
+deriving distinct positions from `order_index` for content this tool
+already gives it a real, resolvable order for.
+
+**A real table's row count and a table-cell's own row survival — checked,
+no bug found.** A specific real table ("1. Real table with actual data")
+suspected of losing its last row matches OneNote's own MHT export exactly
+(4 rows: header + 3 data rows, byte-for-byte identical content) — does not
+reproduce on the available test data.
+
+## Section order: real bug found and fixed, one narrow residual case left
+
+`convert.unpack_onepkg` used to list `.one` files in plain alphabetical
+order — never matched OneNote's own sidebar order at all, confirmed
+against a real user's notebook and screenshot (e.g. a real section named
+"MINI" sorted way out of place alphabetically).
+
+Fixed via `convert._toc_order`: each extracted folder's own `Open Notebook
+.onetoc2` (OneNote's table-of-contents file, present alongside the `.one`
+files at every folder level) encodes, per entry, a real, previously
+undocumented shape — reverse-engineered from real notebooks, not from spec
+memory, since pyOneNote has no parsing class at all for this file's node
+type (`ObjectDeclarationWithRefCountFNDX`, confirmed absent from
+`FileNode.py` entirely, not just unnamed): 16-byte GUID, 4-byte
+little-endian order index, 4-byte little-endian byte-length (incl. the
+UTF-16 null terminator), then the name itself as null-terminated UTF-16LE.
+The byte-length field doubles as a free correctness check for the
+brute-force, every-offset scan `_toc_order` uses to find these (verified
+zero false positives on two real, unrelated notebooks). `unpack_onepkg`
+sorts each folder's own children by this index (files before subfolders,
+matching a real, verified behavior of OneNote's own sidebar: section
+groups always sort after every individual section at the same level, not
+interleaved by raw index) — falling back to alphabetical for anything the
+index doesn't cover.
+
+Verified against a real notebook's screenshot: all 9 top-level individual
+sections, and all 5 of one section-group's own children, matched exactly.
+A second, larger real notebook (61 sections across 5 groups) converts
+with no crash and internally-consistent ordering.
+
+**A real, related bug found and fixed while verifying this**: a
+non-ASCII entry name (e.g. "Meie näitus") decodes CORRECTLY straight out
+of `.onetoc2` — but the on-disk `.one` filename `expand.exe`/`cabextract`
+actually produced for that same section is mojibake'd (see above) at
+extraction time. `unpack_onepkg`'s lookup was keying purely off the
+correctly-decoded name, silently missing the mojibake'd on-disk filename
+entirely and falling back to sort-last for every affected section —
+confirmed on the real notebook: "Meie näitus" (real index 16 of 18) was
+sorting dead last instead. Fixed by also indexing each name under its own
+forward-mojibake'd form (the same Latin-1/UTF-8 round-trip `_fix_mojibake`
+undoes, run in the opposite direction) so the on-disk lookup hits either
+way.
+
+**Known residual limitation, not yet resolved**: the relative order
+BETWEEN multiple sibling section-GROUP folders themselves (as opposed to
+group-vs-section, which is correct) doesn't fully match the real index
+field in the one confirmed counter-example checked — a real notebook's
+"PC Builds" group has a lower raw TOC index than its "Arduino" group, but
+the real sidebar screenshot shows Arduino listed first. Each group's OWN
+children are internally correct; only the groups' mutual order can be
+wrong. Left unresolved rather than guessed at — a repeated ~20-byte
+prefix pattern preceding each group's GUID looked like it might hold a
+separate ordering field, but this wasn't confirmed before landing the fix
+above, and the fix above is a strict improvement over the prior plain
+alphabetical sort either way (was wrong for both section-vs-group AND
+group-vs-group before; now only group-vs-group can still be wrong).
+
+## A page's content order lost a node when reachable from more than one page — real bug found and fixed
+
+Reported symptom on a real notebook: a header rendered AFTER a list that
+structurally followed it on the same page. Root cause: `ordering
+._page_content_order`'s `seen`/`order` tracking was shared across EVERY
+`jcidPageManifestNode` root in the file, not reset per page.
+
+A node's FIRST visit — across the WHOLE file, not just its own page —
+decides whether it ever gets an order slot. If that first visit happened
+via a stale/duplicate revision-store reference from an unrelated page's
+`TitleNode` (the `in_title` branch never touches `order`, only
+`title_ids`), the node got marked `seen` there and nothing else. Its real,
+later visit as body content on its OWN actual page then hit the `nid in
+seen` guard and returned immediately — permanently missing from `order`,
+landing on `_build_blocks`'s `10**9` trailing-fallback, sorting after
+every sibling that DID get a resolved position.
+
+Verified before fixing, not assumed: a synthetic repro (mirroring
+`test_ordering.py`'s existing outline/page-guid-sharing pattern) —
+an unrelated "stale" page's title reaching the same node identity as a
+real page's own header — reproduced exactly this: the header absent from
+`order` entirely while a list item declared after it on the real page got
+a real value. Fixed by giving each page-manifest root its own fresh `seen`
+set (`order`'s own `nid not in order` check already prevents a genuinely-
+resolved value from being overwritten, so this only stops the permanent,
+wrongful block). Re-ran the repro against the fix: header now gets a real
+order value and correctly precedes the list item. Added as a permanent
+regression test (`test_page_content_order_resets_seen_per_page_manifest_root`).
+Full test suite unaffected (no other test's expectations changed).
+
 ## A run's own guid is an outline-box guid, not always the page's — real, wide-reaching bug found and fixed
 
 Found triaging a large batch of real-notebook bugs a user reported after

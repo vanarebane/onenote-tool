@@ -240,6 +240,35 @@ def _resolve_run_format(ps_ref, trf_ref, by_id) -> Optional[dict]:
             if cur:
                 fmt[key] = cur
         fmt['heading'] = _heading_level(ps.get('val', {}).get('ParagraphStyleId'))
+        # The paragraph's OWN font size/family (e.g. a 'cite'-styled
+        # paragraph's real 9pt, vs. an ordinary body paragraph's 11pt) —
+        # real bug found and fixed: this used to be read ONLY from
+        # TextRunFormatting, on the theory that OneNote only ever writes
+        # FontSize there when a run differs from "the" paragraph default,
+        # so ParagraphStyle's own copy was assumed to always be the same,
+        # boring page-wide default not worth surfacing. Verified false
+        # against a real page (Test/Rich content/"Section page 1"): a
+        # citation line's `cite`-style paragraph carries its own, genuinely
+        # different FontSize (9pt) directly on ParagraphStyle, with NO
+        # TextRunFormatting override at all — since the run's actual size
+        # already equals ITS OWN paragraph's default, OneNote correctly
+        # wrote no per-run override, but that default isn't the SAME
+        # default as an ordinary body paragraph's, so dropping it here lost
+        # real, visible information (OneNote's own MHT export renders this
+        # line noticeably smaller). Cross-checked against OneNote's own MHT
+        # ground truth for several pages: EVERY paragraph's own `<p style=
+        # ...>` carries an explicit font-size/font-family, not just
+        # "special" ones — so reading it here as the base (same pattern
+        # already used for bold/italic/color/highlight above), with
+        # TextRunFormatting still overriding when it differs, matches real
+        # ground truth exactly instead of guessing which styles "count".
+        ps_val = ps.get('val', {})
+        size = _font_size_pt(ps_val.get('FontSize'))
+        if size:
+            fmt['font_size'] = size
+        family = str(ps_val.get('Font') or '').replace('\x00', '').strip()
+        if family:
+            fmt['font_family'] = family
 
     tr_ref = (trf_ref[0] if trf_ref else None) if isinstance(trf_ref, list) else trf_ref
     trf = by_id.get(_norm_identity(tr_ref)) if tr_ref else None
@@ -252,15 +281,6 @@ def _resolve_run_format(ps_ref, trf_ref, by_id) -> Optional[dict]:
             fmt['color'] = over['color']
         if over['highlight']:
             fmt['highlight'] = over['highlight']
-        # Deliberately read font size/family from TextRunFormatting ONLY,
-        # never from ParagraphStyle: OneNote itself only ever writes a
-        # FontSize/Font onto TextRunFormatting when the run's font actually
-        # differs from the paragraph's own default (verified: a page
-        # demonstrating four sizes had a TextRunFormatting.FontSize on the
-        # three non-default runs and none at all on the "Normal"-sized one,
-        # even though ParagraphStyle.FontSize is always present on every
-        # run regardless). Reading ParagraphStyle here too would wrap every
-        # single paragraph in a same-as-default font-size/family span.
         trf_val = trf.get('val', {})
         size = _font_size_pt(trf_val.get('FontSize'))
         if size:

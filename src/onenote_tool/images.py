@@ -39,13 +39,25 @@ def _attachment_kind(ext: str) -> str:
         return 'video'
     return 'file'
 
-# A displayed image's reported width is capped at this many pixels (OneNote's
-# own LayoutMax*/Picture* properties can report arbitrarily large values);
-# height is then recomputed proportionally. This cap is a judgment call
-# inherited unchanged from the tool this package was extracted from — it
-# does NOT affect the stored image bytes, only the width/height numbers
+# A displayed image's reported width is capped at this many pixels; height is
+# then recomputed proportionally so capping never distorts the aspect ratio.
+# This does NOT affect the stored image bytes, only the width/height numbers
 # reported on `PageImage`, which a caller is free to ignore or override.
-_MAX_IMAGE_DISPLAY_WIDTH = 600
+#
+# This used to be 600 — a judgment call inherited unchanged from the tool
+# this package was extracted from, never verified against real data, and
+# actively wrong: two independent real notebooks confirm `LayoutMaxWidth`/
+# `LayoutMaxHeight` match OneNote's own MHT export pixel-for-pixel (a PDF
+# preview at 793x1122; a plain pasted photo at 972x1258 — different content
+# types, both exact matches, no discrepancy either time). That's real
+# evidence this property is trustworthy, not evidence it needs shrinking to
+# a "typical" size — the 600 (and briefly, while investigating this, 900)
+# ceilings were both still silently shrinking legitimate, correctly-sized
+# real content (confirmed: real pasted screenshots in the wild routinely
+# store `LayoutMaxWidth` up to ~2400px). Raised to a genuine safety-net
+# value instead — one meant to catch an actually-pathological stored value,
+# not to second-guess an ordinary large image.
+_MAX_IMAGE_DISPLAY_WIDTH = 4000
 
 
 def _image_dhash(data: bytes) -> Optional[int]:
@@ -158,9 +170,20 @@ def _build_page_image(val, files_by_identity, image_counter, report):
             return default
 
     # LayoutMax* is the on-page display size; fall back to the intrinsic size.
-    width = _int(val.get('LayoutMaxWidth'), 0) or _int(val.get('PictureWidth'), 320)
+    width_raw = _int(val.get('LayoutMaxWidth'), 0) or _int(val.get('PictureWidth'), 320)
     height = _int(val.get('LayoutMaxHeight'), 0) or _int(val.get('PictureHeight'), 240)
-    width = max(40, min(width, _MAX_IMAGE_DISPLAY_WIDTH))
+    width = max(40, min(width_raw, _MAX_IMAGE_DISPLAY_WIDTH))
+    if width_raw > _MAX_IMAGE_DISPLAY_WIDTH:
+        # Real bug found and fixed: capping `width` alone without rescaling
+        # `height` to match distorts the image (and, worse, can make it
+        # come back visibly SMALLER than OneNote's own real display size —
+        # confirmed against a real embedded PDF preview: OneNote's own MHT
+        # export renders it at 793x1122, this used to report 600x1122,
+        # neither the real size nor the real aspect ratio). `recovery.py`'s
+        # own two image-sizing call sites already rescale height the same
+        # way when capping an intrinsic pixel width; this brings the normal
+        # pipeline's LayoutMax*-based sizing in line with that.
+        height = round(height * width / width_raw)
     source_width = _int(val.get('PictureWidth'), 0) or len(fmeta['content'])
     filename = str(val.get('ImageFilename') or '').replace('\x00', '').strip()
     image_counter[0] += 1

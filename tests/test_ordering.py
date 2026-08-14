@@ -95,6 +95,61 @@ def test_page_content_order_includes_table_after_intro_run_without_descending_in
     assert title_ids == set()
 
 
+def test_page_content_order_resets_seen_per_page_manifest_root():
+    # Real bug, verified via this exact repro before fixing: `seen`/`order`
+    # were shared across EVERY jcidPageManifestNode root. A node reachable
+    # (via a stale/duplicate reference) from an unrelated STALE page's
+    # TitleNode got marked seen there — a context that never assigns
+    # `order` at all. Its real, later visit as body content on its own
+    # actual page then hit `nid in seen` and returned immediately,
+    # permanently missing from `order` — landing on `_build_blocks`'s
+    # `10**9` trailing fallback. Symptom reported against a real notebook:
+    # a header rendering after a list that structurally follows it.
+    stale_page, real_page = '11111111-1111-1111-1111-111111111111', '22222222-2222-2222-2222-222222222222'
+    stale_title = '33333333-3333-3333-3333-333333333333'
+    shared_header = '44444444-4444-4444-4444-444444444444'
+    list_item = '55555555-5555-5555-5555-555555555555'
+    props = [
+        {
+            'type': 'jcidPageManifestNode',
+            'identity': _ident(stale_page, 10),
+            'val': {'ContentChildNodesOfPageManifest': _ident(stale_page, 20)},
+        },
+        {
+            'type': 'jcidPageNode',
+            'identity': _ident(stale_page, 20),
+            'val': {'StructureElementChildNodes': _ident(stale_title, 21)},
+        },
+        {
+            'type': 'jcidTitleNode',
+            'identity': _ident(stale_title, 21),
+            'val': {'ElementChildNodesOfVersionHistory': _ident(shared_header, 30)},
+        },
+        {
+            'type': 'jcidPageManifestNode',
+            'identity': _ident(real_page, 10),
+            'val': {'ContentChildNodesOfPageManifest': _ident(real_page, 20)},
+        },
+        {
+            'type': 'jcidPageNode',
+            'identity': _ident(real_page, 20),
+            'val': {'ElementChildNodesOfVersionHistory': [
+                *_ident(shared_header, 30), *_ident(list_item, 31),
+            ]},
+        },
+        {'type': 'jcidRichTextOENode', 'identity': _ident(shared_header, 30), 'val': {}},
+        {'type': 'jcidRichTextOENode', 'identity': _ident(list_item, 31), 'val': {}},
+    ]
+    by_id = {}
+    for p in props:
+        by_id[f"{p['identity'][0].split('(')[1].split(')')[0].replace(' ', '')}"] = p
+
+    order, title_ids = _page_content_order(props, by_id)
+
+    assert f'{shared_header},30' in order
+    assert order[f'{shared_header},30'] < order[f'{list_item},31']
+
+
 PAGE_GUID = '11111111-1111-1111-1111-111111111111'
 OUTLINE1_GUID = '22222222-2222-2222-2222-222222222222'
 OUTLINE2_GUID = '33333333-3333-3333-3333-333333333333'
