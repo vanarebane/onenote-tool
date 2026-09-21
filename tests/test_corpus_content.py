@@ -82,6 +82,14 @@ def _assert_scale(result, check: ScaleCheck):
         f'{parse_errors} section_parse_error entries, expected <= {check.max_section_parse_errors}: '
         f'{result.report.failed!r}'
     )
+    if check.min_resolved_authors:
+        resolved = sum(
+            b.get('html', '').count('data-author=')
+            for s in result.sections for p in s.pages for b in p.blocks
+        )
+        assert resolved >= check.min_resolved_authors, (
+            f'resolved author count regressed: {resolved} < {check.min_resolved_authors}'
+        )
 
 
 @pytest.mark.parametrize(

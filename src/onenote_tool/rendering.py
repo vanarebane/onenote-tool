@@ -444,9 +444,14 @@ def _align_attr(align: Optional[str]) -> str:
     return f' style="text-align:{align}"' if align else ''
 
 
+def _author_attr(author: Optional[str]) -> str:
+    return f' data-author="{html.escape(author)}"' if author else ''
+
+
 def _runs_to_paragraphs(runs: list) -> str:
     """Each run is a dict {'t': plain text, 'h': inline html or None, 'yt': ...,
-    'list': {'ordered', 'level'} or absent, 'align': 'center'|'right' or absent}."""
+    'list': {'ordered', 'level'} or absent, 'align': 'center'|'right' or absent,
+    'author': real display name or absent (see parser.py's `author_by_run`)}."""
     parts = []
     pending = []  # consecutive list items -> one <ul>/<ol>
 
@@ -476,18 +481,18 @@ def _runs_to_paragraphs(runs: list) -> str:
             continue
         fmt = run.get('fmt')
         inner = _apply_marks(inner, fmt)
-        align = _align_attr(run.get('align'))
+        attrs = _align_attr(run.get('align')) + _author_attr(run.get('author'))
         li = run.get('list')
         if li:
-            pending.append({'ordered': li['ordered'], 'level': li['level'], 'html': f'<p{align}>{inner}</p>'})
+            pending.append({'ordered': li['ordered'], 'level': li['level'], 'html': f'<p{attrs}>{inner}</p>'})
             continue
         flush()
         level = fmt.get('heading') if fmt else None
         if level:
             tag = f'h{min(level, 3)}'  # h1..h3 only, matching common editor support
-            parts.append(f'<{tag}{align}>{inner}</{tag}>')
+            parts.append(f'<{tag}{attrs}>{inner}</{tag}>')
         else:
-            parts.append(f'<p{align}>{inner}</p>')
+            parts.append(f'<p{attrs}>{inner}</p>')
     flush()
     return ''.join(parts) or '<p></p>'
 

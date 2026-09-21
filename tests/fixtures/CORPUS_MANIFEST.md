@@ -104,9 +104,15 @@ personal/family content — section and page titles beyond the two
 already-public examples above are deliberately not reproduced here; use
 this file for scale/crash-resilience assertions (page/section counts,
 zero unexpected `section_parse_error`) rather than per-page content checks.
-Real properties confirmed to exist on this file (per `Documentation.md`):
-`Author`/`AuthorOriginal`/`AuthorMostRecent` — the basis for the deferred
-per-author-attribution row, not yet read by any code.
+**Basis for the per-author-attribution row (now implemented, see
+`docs/knowledge/known-limitations.md`)**: `Author`/`AuthorOriginal`/
+`AuthorMostRecent` real properties resolved for 99.9% of all real text runs
+across this file's unprotected sections. `corpus_manifest.py`'s
+`ScaleCheck.min_resolved_authors` is the regression check for this — a
+structural count (`data-author=` occurrences), not a named page/title, so
+it's safe against a real personal file. The one password-protected section
+here stays untested for this (and everything else) — no working password is
+configured for it.
 
 ## Ground truth snapshot (informational — will drift as content is added)
 

@@ -498,6 +498,37 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
         for rid in _child_ids(prop):
             list_runs[rid] = {'ordered': ordered, 'level': level}
 
+    # Per-paragraph author attribution (Table A: previously unimplemented —
+    # "nothing in this package reads or exposes" Author/AuthorOriginal/
+    # AuthorMostRecent). A run's own jcidRichTextOENode carries no author
+    # info itself; only its enclosing jcidOutlineElementNode does, so
+    # attribution lands at paragraph granularity, same as list membership
+    # above (and reached the same way: `_child_ids`). AuthorOriginal
+    # references a jcidReadOnlyPersistablePropertyContainerForAuthor object
+    # holding the real author display name as a plain string. Verified
+    # against a real 66-section/1131-page multi-author shared notebook:
+    # resolves for 72293/72339 (99.9%) of all real text runs; the remainder
+    # gets no author tag at all — same "never guess" discipline as
+    # everywhere else here (see known-limitations.md) — rather than a
+    # fabricated one.
+    author_by_run = {}
+    for prop in props:
+        if prop.get('type', '') != 'jcidOutlineElementNode':
+            continue
+        val = prop.get('val', {})
+        orig_ref = val.get('AuthorOriginal')
+        ref = orig_ref[0] if isinstance(orig_ref, list) and orig_ref else None
+        if not ref:
+            continue
+        container = by_id.get(_norm_identity(ref))
+        if not container or container.get('type') != 'jcidReadOnlyPersistablePropertyContainerForAuthor':
+            continue
+        name = _clean_title(container.get('val', {}).get('Author'))
+        if not name:
+            continue
+        for rid in _child_ids(prop):
+            author_by_run[rid] = name
+
     # Reconstruct visual order + which runs are the page title, from the tree.
     order_index, title_run_ids = _page_content_order(props, by_id)
     # Section page order (which page comes first), keyed by page object-space guid.
@@ -682,6 +713,9 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
             run_entry = {'t': text, 'h': inline_html, 'rid': run_id}
             if run_id in list_runs:
                 run_entry['list'] = list_runs[run_id]
+            author = author_by_run.get(run_id)
+            if author:
+                run_entry['author'] = author
             align = _paragraph_alignment(val.get('ParagraphAlignment'))
             if align:
                 run_entry['align'] = align

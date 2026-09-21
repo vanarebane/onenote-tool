@@ -1122,6 +1122,59 @@ calls `app` directly without going through that guard, so a fix placed
 there wouldn't apply to a real install. Verified: the same real 250MB
 notebook now converts and prints its full report without error.
 
+## Per-author attribution: implemented at paragraph granularity, real properties found
+
+Table A used to mark this "confirmed present, nothing reads it" — `Author`/
+`AuthorOriginal`/`AuthorMostRecent` are named properties in pyOneNote's own
+`_property_id_name_mapping` (`0x1C001D75`/`0x20001D78`/`0x20001D79`), just
+never wired into anything here. Raw-scanning a real 66-section/1131-page
+multi-author shared notebook (synced between 2 real people over years)
+found the real structural chain:
+
+- Every `jcidRichTextOENode` (a run's own text node) is a direct child —
+  via `ContentChildNodesOfPageManifest`, the same child-list property
+  `list_runs` already reads for list membership — of exactly one
+  `jcidOutlineElementNode` (a paragraph). The run's own node carries no
+  author info at all; only its enclosing paragraph does. This makes
+  per-*run* attribution (as Table A's row used to phrase it) not something
+  the format actually supports — per-*paragraph* is the real ceiling, and
+  what's implemented.
+- `jcidOutlineElementNode.AuthorOriginal` is a single-element `ArrayOfObjectID`
+  reference to a `jcidReadOnlyPersistablePropertyContainerForAuthor` object,
+  whose own `Author` property is the real display name as a plain UTF-16
+  string — no further indirection needed once you have that object.
+- Resolving `AuthorOriginal` -> container -> `Author` string across every
+  real text run in the whole file (all 66 sections, both `.one` files that
+  make up the notebook's revision-store trees) succeeded for 72293/72339
+  runs (99.9%). `AuthorMostRecent` resolves for slightly more (72339/72339
+  in the same run) but was deliberately NOT used — "who wrote it" (the
+  row's own stated goal) is `AuthorOriginal`; `AuthorMostRecent` answers a
+  different question (who last touched it) that Table A doesn't ask.
+- `parser.py`'s `author_by_run` builds this map once per section, the same
+  way `list_runs` does; `rendering._author_attr` emits it as
+  `data-author="..."` on the paragraph's own `<p>`/`<h#>`/list-item tag
+  (not a nested `<span>` — same reasoning as paragraph alignment: this is a
+  paragraph-level property, not a per-character one). A run whose author
+  can't be resolved (the 0.1% gap above) gets no attribute at all — the
+  same "never guess" fallback the row already specified before this was
+  implemented.
+- **Protected sections: tried, hits the same decode ceiling as everything
+  else there, worse than most.** Against a real protected section (correct
+  password supplied), only 38 of 602 `jcidOutlineElementNode`s even carried
+  the `AuthorOriginal` reference at all, and every one of those 38 pointed
+  at a `jcidReadOnlyPersistablePropertyContainerForAuthor` that itself never
+  decoded a real `Author` string — 0/564 real text runs resolved. Not a
+  bug in the new code; a real object failing to decode under encryption is
+  the same failure shape already documented for protected lists/tables
+  above.
+- **Table cells: not wired in.** A cell's own text runs are collected by a
+  separate walk (`rendering._collect_cell_runs`, reached via
+  `_resolve_table_grid`) that doesn't have access to `author_by_run` —
+  extending it would mean threading that map through the whole cell-walk
+  call chain for a case not yet confirmed to matter (no real notebook with
+  authored table content inside a shared, multi-author section has been
+  checked). Left as a known, documented gap rather than guessed at.
+
 ## Testing has real gaps
 
 The test suite (`tests/`) is synthetic-only by design (see

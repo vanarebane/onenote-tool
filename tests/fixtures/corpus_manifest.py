@@ -37,6 +37,7 @@ class ScaleCheck:
     min_page_count: int
     min_section_count: int
     max_section_parse_errors: int = 0
+    min_resolved_authors: int = 0
 
 
 @dataclass
@@ -92,7 +93,12 @@ CORPUS: list[CorpusFile] = [
     CorpusFile(
         filename='Shared.onepkg',
         password_env={},  # one protected section exists; name withheld (real personal notebook)
-        scale_check=ScaleCheck(min_page_count=1131, min_section_count=66),
+        # min_resolved_authors: the per-author-attribution regression check —
+        # real run count observed was 14901/20235 rendered paragraph tags
+        # carrying a resolved `data-author` attribute; well under half of
+        # that as the floor, same margin-below-observed convention as the
+        # page/section counts above.
+        scale_check=ScaleCheck(min_page_count=1131, min_section_count=66, min_resolved_authors=5000),
     ),
 ]
 
