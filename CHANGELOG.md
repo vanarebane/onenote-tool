@@ -24,6 +24,13 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions match
   its chance to ever get one, even on its own real page later. Verified
   with a synthetic repro before fixing (not assumed) — see
   `docs/knowledge/known-limitations.md`.
+- **Real bug**: a literal comma in a section/group name came back as the
+  literal two-character sequence "^J" (baked into the source `.onepkg`'s
+  own bytes, confirmed via hex dump — not an extraction-tool artifact).
+  Confirmed twice independently on real, purpose-built test data covering
+  every other ordinary punctuation mark, with no other corruption found —
+  fixed with `convert._fix_comma_corruption`. See
+  `docs/knowledge/known-limitations.md`.
 - **Real bug**: a picture pasted directly into a table cell rendered
   correctly inline AND, separately, as its own stray standalone image
   block. `_build_blocks` now skips a ref already rendered inline via a

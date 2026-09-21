@@ -49,6 +49,40 @@ def _fix_mojibake(name: str) -> str:
         return name
 
 
+def _fix_comma_corruption(name: str) -> str:
+    """Undo a real, verified bug baked into the SOURCE `.onepkg` itself (not
+    an extraction-tool artifact like `_fix_mojibake` above — confirmed via
+    hex dump: the corrupted bytes are already present in the raw `Open
+    Notebook.onetoc2` before `expand.exe`/`cabextract` ever touch it): a
+    literal comma in a section/group name comes back as the literal
+    two-character sequence "^J" (`5e 00 4a 00` in the source UTF-16LE
+    bytes — real caret + capital-J characters, NOT a 0x0A line-feed control
+    byte, despite looking like classic caret-notation for one).
+
+    Confirmed independently TWICE on real, purpose-built test data covering
+    every OTHER ordinary punctuation mark (semicolon, period, exclamation,
+    apostrophe, hyphen, equals, parens) — none of those corrupt, only comma
+    does, byte-identical corruption shape both times ("Skills, Tools" ->
+    "Skills^J Tools"; "Coma, Test" -> "Coma^J Test"). Unlike the mojibake
+    fix, this has no self-verifying round-trip (nothing about "^J" proves
+    it used to be a comma) — the confidence here comes from two independent
+    reproductions with no counter-example among 7 other punctuation marks
+    tested, not from a mathematical property of the transform itself. If a
+    real section name is ever found that's SUPPOSED to contain a literal
+    "^J", this will incorrectly mangle it — accepted as a real but very
+    unlikely risk, since typing this two-character sequence as ordinary
+    text is not something section titles have any real precedent for.
+    """
+    return name.replace('^J', ',')
+
+
+def _fix_extracted_name(name: str) -> str:
+    """Both real, verified corrections applied to a section/group name
+    recovered from the extracted `.onepkg` — see `_fix_mojibake` and
+    `_fix_comma_corruption` for what each undoes and why it's safe."""
+    return _fix_comma_corruption(_fix_mojibake(name))
+
+
 def _find_expand_exe() -> Optional[str]:
     candidate = os.path.join(os.environ.get('WINDIR', r'C:\Windows'), 'System32', 'expand.exe')
     if os.path.exists(candidate):
@@ -287,11 +321,11 @@ def process_sections(
     passwords_seen = list(dict.fromkeys(p for p in (section_passwords or {}).values() if p))
 
     for i, one_path in enumerate(one_files):
-        section_name = _fix_mojibake(os.path.splitext(os.path.basename(one_path))[0])
+        section_name = _fix_extracted_name(os.path.splitext(os.path.basename(one_path))[0])
         # Subfolders in the .onepkg are OneNote section groups; the relative
         # directory path from the notebook root is the group hierarchy.
         rel_dir = os.path.relpath(os.path.dirname(one_path), work_dir)
-        group_path = [] if rel_dir in ('.', '') else [_fix_mojibake(p) for p in rel_dir.split(os.sep)]
+        group_path = [] if rel_dir in ('.', '') else [_fix_extracted_name(p) for p in rel_dir.split(os.sep)]
         explicit = (section_passwords or {}).get(section_name)
         candidates = list(dict.fromkeys(([explicit] if explicit else []) + passwords_seen))
 
@@ -353,7 +387,7 @@ def convert_onepkg(
         try:
             progress_cb('start', {
                 'sections': [
-                    {'name': _fix_mojibake(os.path.splitext(os.path.basename(p))[0]), 'size': sizes[p]}
+                    {'name': _fix_extracted_name(os.path.splitext(os.path.basename(p))[0]), 'size': sizes[p]}
                     for p in one_files
                 ],
                 'total_size': total_size,

@@ -13,6 +13,8 @@ build/
 # this ignore rule keeps them out of git no matter where they land.
 tests/fixtures/*
 !tests/fixtures/README.md
+!tests/fixtures/CORPUS_MANIFEST.md
+!tests/fixtures/corpus_manifest.py
 *.onepkg
 *.one
 *.onex

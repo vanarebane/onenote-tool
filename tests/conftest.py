@@ -32,3 +32,22 @@ def local_one_file() -> str:
             '(see tests/fixtures/README.md).',
         )
     return path
+
+
+@pytest.fixture
+def local_corpus_dir() -> str:
+    """Path to a folder of real, locally-supplied `.onepkg` files, or skip.
+
+    Unlike `local_onepkg`/`local_one_file` (exactly one file each), this
+    backs `test_corpus_content.py`'s multi-file, content-correctness suite —
+    see tests/fixtures/CORPUS_MANIFEST.md for what each named file covers.
+    A partial corpus (missing some of the manifest's files) is fine; each
+    entry is skipped individually, not the whole test.
+    """
+    path = os.environ.get('ONENOTE_TOOL_TEST_CORPUS_DIR')
+    if not path or not os.path.isdir(path):
+        pytest.skip(
+            'Set ONENOTE_TOOL_TEST_CORPUS_DIR to a local folder of .onepkg files '
+            'to run this test (see tests/fixtures/README.md and CORPUS_MANIFEST.md).',
+        )
+    return path

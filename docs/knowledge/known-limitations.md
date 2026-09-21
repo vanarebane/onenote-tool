@@ -154,20 +154,38 @@ guessed at — `SectionResult.name` may not always exactly match a section's
 true display name when it contains punctuation `expand.exe`/CAB
 extraction treats as filesystem-special.
 
-**Root cause pinned down (still not fixed — same reasoning as above still
-applies).** A hex dump of the SOURCE `.onepkg`'s own `Open Notebook
+**Root cause pinned down AND now fixed — comma specifically, confirmed
+twice.** A hex dump of the SOURCE `.onepkg`'s own `Open Notebook
 .onetoc2` bytes (not anything either extraction tool produces) shows the
 name field already reads `Skills` + `5e 00 4a 00` (`^` U+005E, `J`
 U+004A, literal two-character `^J`, NOT a control character — a real line
 feed would be `0a 00`) + ` Tools.one` — confirmed at the exact byte
 offset, both before and after CAB extraction, identical either way. This
 is baked into the notebook file Microsoft's own OneNote client produced,
-not something `expand.exe`/`cabextract`/this package introduces or could
-safely guess a fix for — same "one observed example, no safe un-escaping
-rule" reasoning as above, now with a confirmed origin instead of an
-unknown one. `convert.unpack_onepkg`'s section-order fix (below) matches
-this section by its corrupted on-disk name, same as any other section —
-ordering is unaffected by the corruption, only the display name is.
+not something `expand.exe`/`cabextract`/this package introduces.
+
+Originally left unfixed ("one observed example, no safe un-escaping
+rule"), then confirmed as a real, general, SAFE-to-fix pattern: purpose-
+built real test data covering every OTHER ordinary punctuation mark a
+OneNote section name can contain (semicolon, period, exclamation,
+apostrophe, hyphen, equals, parens — `?*\/:<>|&#"%` are rejected outright
+by OneNote's own section-naming UI, confirmed by the user directly) found
+**zero** other corrupted names — only a second, independent comma case
+("Coma, Test" -> "Coma^J Test"), byte-identical corruption shape to the
+original ("Skills, Tools" -> "Skills^J Tools"). Two independent real
+reproductions with no counter-example among 7 other punctuation marks is
+enough to fix, unlike a single observed example. Fixed with
+`convert._fix_comma_corruption` (`'^J'` -> `','`), composed with the
+existing mojibake fix via `convert._fix_extracted_name`. Unlike the
+mojibake fix, this has no self-verifying round-trip property — confidence
+comes from the two clean reproductions plus the negative-result punctuation
+sweep, not from a mathematical property of the transform. If a real
+section name is ever found that's supposed to contain a literal `^J`,
+this will incorrectly mangle it — accepted as a real but very unlikely
+risk. `convert.unpack_onepkg`'s section-order fix matches a section by its
+still-corrupted on-disk filename — ordering is unaffected by this fix,
+only the display name is (the fix runs on `SectionResult.name`/
+`group_path`, not on `unpack_onepkg`'s own returned file paths).
 
 ## Several real, lower-priority bugs found and fixed testing real notebooks
 
