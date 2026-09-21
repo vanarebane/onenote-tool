@@ -511,7 +511,7 @@ def _child_ids(prop) -> list:
     return [x for x in out if x]
 
 
-def _collect_cell_runs(nid, by_id, consumed, list_runs, image_builder, images, depth=0, seen=None) -> list:
+def _collect_cell_runs(nid, by_id, consumed, list_runs, image_builder, images, author_by_run=None, depth=0, seen=None) -> list:
     """Recursively collect a table cell's own text runs from the object tree,
     each resolved the SAME way a page's body runs are (formatting, paragraph
     alignment, list membership) — same run-dict shape `_runs_to_paragraphs`
@@ -528,7 +528,13 @@ def _collect_cell_runs(nid, by_id, consumed, list_runs, image_builder, images, d
     mixed into the returned run list — images render after the cell's text,
     not interleaved at their exact original position (a simplification: the
     one real test cell with an image had no other
-    content to interleave with)."""
+    content to interleave with).
+
+    `author_by_run` (optional, `run identity -> display name`) is the same
+    map `parser.py` builds for a page's own body paragraphs — see its
+    `author_by_run`/`known-limitations.md` for how it's resolved. A cell's
+    text run is reached by the same `jcidRichTextOENode` type as body text,
+    so the same map applies unchanged; no cell-specific resolution needed."""
     seen = seen if seen is not None else set()
     if depth > 8 or not nid or nid in seen:
         return []
@@ -556,6 +562,9 @@ def _collect_cell_runs(nid, by_id, consumed, list_runs, image_builder, images, d
         entry = {'t': text, 'h': inline_html}
         if nid in list_runs:
             entry['list'] = list_runs[nid]
+        author = (author_by_run or {}).get(nid)
+        if author:
+            entry['author'] = author
         align = _paragraph_alignment(val.get('ParagraphAlignment'))
         if align:
             entry['align'] = align
@@ -570,11 +579,11 @@ def _collect_cell_runs(nid, by_id, consumed, list_runs, image_builder, images, d
         return []
     runs = []
     for cid in _child_ids(prop):
-        runs.extend(_collect_cell_runs(cid, by_id, consumed, list_runs, image_builder, images, depth + 1, seen))
+        runs.extend(_collect_cell_runs(cid, by_id, consumed, list_runs, image_builder, images, author_by_run, depth + 1, seen))
     return runs
 
 
-def _resolve_cell_html(nid, by_id, consumed, list_runs=None, image_builder=None, images=None) -> str:
+def _resolve_cell_html(nid, by_id, consumed, list_runs=None, image_builder=None, images=None, author_by_run=None) -> str:
     """Render one table cell's full content — same formatting/alignment/list
     rendering as a page's own body text, plus any image(s) pasted directly
     into the cell (see `_collect_cell_runs`; `images`, if given, gets any
@@ -592,7 +601,7 @@ def _resolve_cell_html(nid, by_id, consumed, list_runs=None, image_builder=None,
     # own) rendered cell 2's image a second time because both looped over
     # the same already-shared accumulator.
     local_images = []
-    runs = _collect_cell_runs(nid, by_id, consumed, list_runs or {}, image_builder, local_images)
+    runs = _collect_cell_runs(nid, by_id, consumed, list_runs or {}, image_builder, local_images, author_by_run)
     html = _runs_to_paragraphs(runs) if runs else ''
     for image in local_images:
         html += _image_block_html(image.ref)
@@ -601,7 +610,7 @@ def _resolve_cell_html(nid, by_id, consumed, list_runs=None, image_builder=None,
     return html
 
 
-def _resolve_table_grid(table_prop, by_id, consumed, list_runs=None, image_builder=None, images=None) -> list:
+def _resolve_table_grid(table_prop, by_id, consumed, list_runs=None, image_builder=None, images=None, author_by_run=None) -> list:
     """Walk table -> rows -> cells -> content into a 2D grid of
     `{'html', 'color', 'colspan'}` dicts (`color` from `CellShadingColor`,
     `#rrggbb` or `None` for an unshaded cell — same 4-byte RGB+alpha-flag
@@ -628,7 +637,7 @@ def _resolve_table_grid(table_prop, by_id, consumed, list_runs=None, image_build
             if span == 0:
                 continue
             color = _color_from_bytes((cell_prop.get('val', {}) if cell_prop else {}).get('CellShadingColor'))
-            html = _resolve_cell_html(cid, by_id, consumed, list_runs, image_builder, images)
+            html = _resolve_cell_html(cid, by_id, consumed, list_runs, image_builder, images, author_by_run)
             cells.append({'html': html, 'color': color, 'colspan': span or 1})
         grid.append(cells)
     return grid

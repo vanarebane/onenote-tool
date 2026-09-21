@@ -1167,13 +1167,15 @@ found the real structural chain:
   bug in the new code; a real object failing to decode under encryption is
   the same failure shape already documented for protected lists/tables
   above.
-- **Table cells: not wired in.** A cell's own text runs are collected by a
-  separate walk (`rendering._collect_cell_runs`, reached via
-  `_resolve_table_grid`) that doesn't have access to `author_by_run` —
-  extending it would mean threading that map through the whole cell-walk
-  call chain for a case not yet confirmed to matter (no real notebook with
-  authored table content inside a shared, multi-author section has been
-  checked). Left as a known, documented gap rather than guessed at.
+- **Table cells: wired in, verified.** A cell's own text runs are collected
+  by a separate walk (`rendering._collect_cell_runs`, reached via
+  `_resolve_table_grid`/`_resolve_cell_html`) that didn't originally have
+  access to `author_by_run` — now threaded through all three as an optional
+  trailing parameter, same pattern `list_runs`/`image_builder` already use.
+  A cell's text run is the same `jcidRichTextOENode` type as body text, so
+  no cell-specific resolution logic was needed, just the plumbing. Verified
+  against the same real multi-author file: 1225/1394 real table paragraph
+  tags resolved a `data-author`.
 
 ## Testing has real gaps
 

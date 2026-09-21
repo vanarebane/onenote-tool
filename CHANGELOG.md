@@ -8,13 +8,16 @@ follows [Keep a Changelog](https://keepachangelog.com/); versions match
 
 ### Added
 - Per-author attribution: a paragraph written on a shared, multi-author
-  notebook now carries `data-author="..."` (real display name, resolved via
-  `AuthorOriginal`) on its own `<p>`/`<h#>`/list-item tag. Verified against
-  a real 66-section/1131-page multi-author shared notebook: resolves for
-  99.9% of all real text runs; unresolvable runs get no author tag at all,
-  never a guessed one. Paragraph granularity, not per-run — that's the real
-  ceiling the format supports. Not wired into table cells or protected
-  sections yet — see `docs/knowledge/known-limitations.md`.
+  notebook (including inside a table cell) now carries `data-author="..."`
+  (real display name, resolved via `AuthorOriginal`) on its own
+  `<p>`/`<h#>`/list-item tag. Verified against a real 66-section/1131-page
+  multi-author shared notebook: resolves for 99.9% of all real body-text
+  runs and 1225/1394 real table-cell paragraphs; unresolvable runs get no
+  author tag at all, never a guessed one. Paragraph granularity, not
+  per-run — that's the real ceiling the format supports. Tried against a
+  real protected section too: hits the same per-object decode ceiling
+  documented elsewhere for protected content (0/564 resolved) — see
+  `docs/knowledge/known-limitations.md`.
 - `PageFile.icon_ref` — a `jcidEmbeddedFileNode`'s own preview picture
   (`PictureContainer`) is now linked to its real attached file
   (`EmbeddedFileContainer`) instead of surfacing as an unrelated standalone

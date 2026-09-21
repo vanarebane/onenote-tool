@@ -857,7 +857,7 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
                     cell_images = []
                     grid = _resolve_table_grid(
                         prop, by_id, grp.setdefault('table_consumed', set()), list_runs,
-                        _cell_image_builder, cell_images,
+                        _cell_image_builder, cell_images, author_by_run,
                     )
                     if grid:
                         grp.setdefault('tables', []).append((tid, grid))
