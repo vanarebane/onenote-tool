@@ -4,6 +4,53 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/); versions match
 `pyproject.toml`.
 
+## [Unreleased]
+
+### Fixed
+- **Password-protected sections now decrypt exactly**, with full parity:
+  the protected test section converts to the same output as its
+  unprotected twin (all 20 pages — text, formatting, lists, tables, links,
+  ink, YouTube, author attribution, image/attachment bytes, `regions`,
+  dates, backgrounds, page levels). Previously about half of protected
+  content was lost or landed on the wrong page. The earlier model (whole
+  file as one 4096-byte-segmented stream) was wrong: each object's
+  PropertySet body is its own AES-CBC stream — `uint32` length +
+  ciphertext after the plaintext ID streams, decrypting to a 16-byte random
+  block, a `uint16` padding length, the PropertySet and the padding. See
+  `docs/knowledge/ms-offcrypto-encryption.md`.
+
+- **Version-history snapshots no longer leak into the output.** Each page's
+  older versions are stored in the file as complete snapshots in separate
+  revision contexts; pyOneNote read them all. Only each page's current
+  (default-context) revision is read now, and content is assigned to the
+  page whose object space it lives in. Fixes stale titles on renamed pages,
+  content landing on the wrong page and stray-fragment pages: 425 -> 340
+  pages on one real notebook, 1131 -> 917 on another, with word recall
+  against OneNote's own MHT export up from 0.900 to 0.960. Attachments that
+  survive only in an old snapshot are no longer reported as failed.
+- **Paragraphs with a note tag lost their text.** pyOneNote doesn't read
+  property types 0x10/0x11 (nested property sets) and truncated the object
+  there; `NoteTagStates` comes before the text. All property types are read
+  now.
+
+### Added
+- Note tags (To Do, Important, custom labels): a leading
+  `<span class="onenote-tag" data-tag="..." data-checked="...">` with a
+  checkbox glyph or the label.
+- Equations convert to MathML when they use only verified structures
+  (brackets, superscript, n-ary operators, stacks); others keep the
+  placeholder.
+- `PageResult.rule_line_color`.
+- `onenote-tool convert --offline` / `ONENOTE_TOOL_OFFLINE=1`: no network
+  requests.
+- Parsing is thread-safe (parse state is thread-local).
+
+### Removed
+- The shadow-buffer decryption and its heuristic PropertySet scans
+  (`decrypt.decrypt_package`, the realign and title-rescue scans in
+  `_patches`). Structural page recovery (`recovery.py`) now runs only as a
+  fallback when a decrypted section yields no pages.
+
 ## [0.1.5] - 2026-08-14
 
 ### Added

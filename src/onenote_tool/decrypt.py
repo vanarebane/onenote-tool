@@ -20,20 +20,21 @@ used first to verify the password (decrypt encryptedVerifierHashInput/Value
 and compare), then to unwrap `encryptedKeyValue` into the real file/content
 encryption key.
 
-The one OneNote-specific (undocumented) part: **the entire .one file, from
-byte 0, is one contiguous "EncryptedPackage" stream** in the same shape as
-OOXML's own EncryptedPackage — split into independently-IV'd 4096-byte
-segments (`IV = SHA512(keyData.saltValue + LE32(segment_index))[:blockSize]`,
-segment_index = absolute file offset // 4096, CBC-chained within each
-segment) — even though large parts of the file (the Header, FileNodeList
-skeleton, object declarations/jcids) are ALSO independently readable as
-plaintext directly from the raw bytes. Only PropertySet BODIES (the actual
-per-object content: text, titles, ...) turn out to be real ciphertext when
-read from the raw file; decrypting the surrounding structural bytes (which
-were never really "for" decryption) just produces noise nobody reads. See
-`onenote_tool._patches`'s `_propset_init` patch, which redirects ONLY
-`PropertySet.__init__` reads through this decrypted shadow buffer, at the
-same file offset, leaving every other structural read on the original file.
+The OneNote-specific (undocumented) part is WHAT gets encrypted. Everything
+structural — the Header, FileNodeLists, object declarations/jcids, and each
+object's OIDs/OSIDs/ContextIDs compact-id streams — stays plaintext. Two
+kinds of payload are encrypted, each as its own independent AES-CBC stream
+with the same IV, `HASH(keyData.saltValue + LE32(0))[:blockSize]`:
+
+- An ObjectSpaceObjectPropSet's PropertySet body. In place of the body the
+  file holds `uint32 cb` followed by `cb` bytes of ciphertext (`cb` is a
+  multiple of the block size). The plaintext is
+  `[16-byte random block][uint16 padLen][PropertySet][padLen bytes padding]`
+  — see `decrypt_object_body`. Verified against every one of 2203 objects in
+  a real protected section: all parse as a PropertySet that ends exactly
+  `padLen` bytes before the end of the plaintext.
+- An embedded file's payload (`FileDataStoreObject`) — see
+  `decrypt_file_payload`.
 """
 
 from __future__ import annotations
@@ -52,8 +53,6 @@ _PASSWORD_NS = '{http://schemas.microsoft.com/office/2006/keyEncryptor/password}
 _BLOCK_VERIFIER_HASH_INPUT = bytes([0xFE, 0xA7, 0xD2, 0x76, 0x3B, 0x4B, 0x9E, 0x79])
 _BLOCK_VERIFIER_HASH_VALUE = bytes([0xD7, 0xAA, 0x0F, 0x6D, 0x30, 0x61, 0x34, 0x4E])
 _BLOCK_KEY_VALUE = bytes([0x14, 0x6E, 0x0B, 0xE7, 0xAB, 0xAC, 0xD0, 0xD6])
-
-SEGMENT_SIZE = 4096
 
 
 class EncryptionInfo:
@@ -74,7 +73,7 @@ class EncryptionInfo:
 
     @property
     def package_salt(self) -> bytes:
-        """Salt used for the whole-file segment IVs (keyData, NOT the password encryptor's own salt)."""
+        """Salt used for the content IV (keyData, NOT the password encryptor's own salt)."""
         return _b64(self.key_data['saltValue'])
 
     @property
@@ -153,41 +152,30 @@ def _segment_iv(package_salt: bytes, segment_index: int, hash_algorithm: str, bl
     return _hash(hash_algorithm, package_salt, struct.pack('<I', segment_index))[:block_size]
 
 
-def decrypt_package(raw: bytes, info: EncryptionInfo, file_key: bytes) -> bytes:
-    """Decrypts the WHOLE file as one segmented EncryptedPackage stream (see
-    module docstring — most of the output is never read; only the ranges
-    PropertySet.__init__ actually consumes matter)."""
-    package_salt = info.package_salt
-    algo = info.hash_algorithm
-    block_size = info.block_size
-    out = bytearray(len(raw))
-    for seg_start in range(0, len(raw), SEGMENT_SIZE):
-        seg_end = min(seg_start + SEGMENT_SIZE, len(raw))
-        chunk = raw[seg_start:seg_end]
-        n = (len(chunk) // 16) * 16
-        if n == 0:
-            continue
-        iv = _segment_iv(package_salt, seg_start // SEGMENT_SIZE, algo, block_size)
-        out[seg_start:seg_start + n] = _aes_cbc_decrypt(file_key, iv, chunk[:n])
-    return bytes(out)
+def decrypt_object_body(ciphertext: bytes, info: EncryptionInfo, file_key: bytes) -> bytes | None:
+    """Decrypts one ObjectSpaceObjectPropSet body (the `cb` ciphertext bytes
+    that follow its plaintext ID streams and `uint32 cb`) and returns just
+    the PropertySet bytes, or None if `ciphertext` doesn't have the shape of
+    an encrypted body (wrong length, or a padding length that doesn't fit)."""
+    if len(ciphertext) < 2 * info.block_size or len(ciphertext) % info.block_size:
+        return None
+    iv = _segment_iv(info.package_salt, 0, info.hash_algorithm, info.block_size)
+    plain = _aes_cbc_decrypt(file_key, iv, ciphertext)
+    pad, = struct.unpack_from('<H', plain, 16)
+    end = len(plain) - pad
+    if end < 18:
+        return None
+    return plain[18:end]
 
 
 def decrypt_file_payload(ciphertext: bytes, info: EncryptionInfo, file_key: bytes) -> bytes:
     """Decrypts a `FileDataStoreObject` payload (the bytes after its 36-byte
     plaintext header — see onenote_tool._patches's `_filedatastore_init`).
 
-    NOT the same segmentation as `decrypt_package`: an embedded file's
-    payload is its own single CBC-chained stream with exactly ONE IV
-    (segment index 0), the whole payload long — confirmed empirically by
-    finding where a real, large (3.5MB, 876-segment-sized) recovered JPEG
-    broke when decrypted with `decrypt_package`'s periodic per-4096-byte IV
-    reset: the break was always the first AES block of a new 4096-byte
-    span, i.e. `decrypt_package` was re-randomizing the IV at points the
-    real encryption never did, corrupting one block every 4096 bytes and
-    (since JPEG's entropy coding loses bit-sync permanently after any
-    corrupted byte) rendering everything past the first break as noise.
-    Removing the periodic reset — one Cipher, one IV, chained straight
-    through — decrypts the same file byte-perfect (verified via PIL:
-    correct 4000x3000 JPEG, no decode error)."""
+    One CBC stream over the whole payload, same IV as `decrypt_object_body`
+    (index 0), no periodic re-keying. Unlike a PropertySet body there's no
+    random first block: the plaintext starts with a uint64 true content size
+    (the payload is that size plus 8, padded to the block size).
+    """
     iv = _segment_iv(info.package_salt, 0, info.hash_algorithm, info.block_size)
     return _aes_cbc_decrypt(file_key, iv, ciphertext)

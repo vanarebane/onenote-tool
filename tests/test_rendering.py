@@ -496,3 +496,26 @@ def test_resolve_table_grid_image_does_not_leak_into_sibling_cell():
     assert len(images) == 1
     assert '<img' in grid[0][0]['html']
     assert '<img' not in grid[0][1]['html']
+
+
+def test_note_tags_resolve_label_shape_and_checked_state():
+    from onenote_tool.rendering import _note_tags, _runs_to_paragraphs
+    by_id = {
+        '3ef755dc-3f34-074a-1e78-6bbcf7778860,33': {'type': 'jcidNoteTagSharedDefinitionContainer',
+                     'val': {'NoteTagLabel': 'To Do\x00', 'NoteTagShape': "b'\x03\x00'"}},
+        'df10b8cd-f7e7-404e-b9ed-1721a39db2a1,5': {'type': 'jcidNoteTagSharedDefinitionContainer',
+                    'val': {'NoteTagLabel': 'Important\x00', 'NoteTagShape': "b'\r\x00'"}},
+    }
+    val = {'NoteTagStates': [
+        {'NoteTagDefinitionOid': ['<ExtendedGUID> (3ef755dc-3f34-074a-1e78-6bbcf7778860, 33)'], 'ActionItemStatus': "b'\x01\x00'"},
+        {'NoteTagDefinitionOid': ['<ExtendedGUID> (df10b8cd-f7e7-404e-b9ed-1721a39db2a1, 5)'], 'ActionItemStatus': "b'\x00\x00'"},
+    ]}
+    tags = _note_tags(val, by_id)
+    assert tags == [
+        {'label': 'To Do', 'checkbox': True, 'checked': True},
+        {'label': 'Important', 'checkbox': False, 'checked': False},
+    ]
+    html = _runs_to_paragraphs([{'t': 'Buy milk', 'h': None, 'tags': tags}])
+    assert html.startswith('<p><span class="onenote-tag" data-tag="To Do" data-checked="true">☑</span> ')
+    assert '<span class="onenote-tag" data-tag="Important">[Important]</span> ' in html
+    assert html.endswith('Buy milk</p>')

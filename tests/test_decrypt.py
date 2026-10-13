@@ -3,11 +3,18 @@ import base64
 import pytest
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-from onenote_tool.decrypt import EncryptionInfo, _aes_cbc_decrypt, _segment_iv, extract_encryption_info
+from onenote_tool.decrypt import (
+    EncryptionInfo,
+    _aes_cbc_decrypt,
+    _segment_iv,
+    decrypt_file_payload,
+    decrypt_object_body,
+    extract_encryption_info,
+)
 
 # A minimal, syntactically-valid Agile Encryption <encryption> descriptor —
 # values are dummy base64 (not a real derivable key), just enough structure
-# for EncryptionInfo to parse the fields decrypt_package/derive_and_verify_key
+# for EncryptionInfo to parse the fields derive_and_verify_key
 # actually read. Real end-to-end decrypt correctness is covered by the
 # real-file smoke test (tests/test_smoke_local_file.py), which needs an
 # actual protected section to mean anything.
@@ -66,3 +73,36 @@ def test_aes_cbc_decrypt_round_trip():
 
 def test_aes_cbc_decrypt_empty_input():
     assert _aes_cbc_decrypt(bytes(32), bytes(16), b'') == b''
+
+
+def _encrypt(info, key, plaintext):
+    iv = _segment_iv(info.package_salt, 0, info.hash_algorithm, info.block_size)
+    encryptor = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor()
+    return encryptor.update(plaintext) + encryptor.finalize()
+
+
+def test_decrypt_object_body_strips_random_block_and_padding():
+    # Plaintext framing: 16-byte random block, uint16 padLen, PropertySet,
+    # padLen bytes of padding (see decrypt.py's module docstring).
+    info = EncryptionInfo(_SAMPLE_XML)
+    key = bytes(range(32))
+    body = b'\x03\x00' + b'P' * 24
+    pad = (-(18 + len(body))) % 16
+    ciphertext = _encrypt(info, key, b'R' * 16 + pad.to_bytes(2, 'little') + body + b'\x00' * pad)
+    assert decrypt_object_body(ciphertext, info, key) == body
+
+
+def test_decrypt_object_body_rejects_wrong_shape():
+    info = EncryptionInfo(_SAMPLE_XML)
+    key = bytes(range(32))
+    assert decrypt_object_body(b'', info, key) is None
+    assert decrypt_object_body(b'x' * 20, info, key) is None  # not block-aligned
+    # padLen larger than the plaintext
+    assert decrypt_object_body(_encrypt(info, key, b'R' * 16 + b'\xff\xff' + b'\x00' * 14), info, key) is None
+
+
+def test_decrypt_file_payload_has_no_random_block():
+    info = EncryptionInfo(_SAMPLE_XML)
+    key = bytes(range(32))
+    plaintext = (5).to_bytes(8, 'little') + b'hello' + b'\x00' * 3
+    assert decrypt_file_payload(_encrypt(info, key, plaintext), info, key) == plaintext

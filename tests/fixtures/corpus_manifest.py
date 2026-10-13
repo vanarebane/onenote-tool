@@ -25,6 +25,8 @@ class Expectation:
     min_regions: int | None = None
     background_color_set: bool | None = None
     rule_lines_set: bool | None = None
+    # True: the page must NOT exist (a previously-produced spurious page).
+    absent: bool = False
     xfail_reason: str | None = None
 
 
@@ -63,32 +65,35 @@ CORPUS: list[CorpusFile] = [
             Expectation('Normal', 'Table', must_contain_block_kind='table'),
             # --- Rich content: page-title-rename repro (checklist item B — already exists) ---
             Expectation('Rich content', 'Rename title third time'),
-            # Known revision-duplicate spurious page (recovery-techniques-log.md)
-            # — its CONTINUED EXISTENCE is the regression signal (a genuine,
-            # accepted, unfixed artifact), not a bug to xfail. If a future
-            # change makes this page disappear, re-read the known-limitations.md
-            # entry before assuming that's an improvement — it could mean real
-            # content silently stopped landing anywhere at all instead.
-            Expectation('Rich content', '2020-03-22'),
+            # Formerly a spurious extra page built from stray table-cell runs
+            # (their TextRunFormatting pointed into another object space).
+            # OneNote's own MHT export has no such page; object-space page
+            # attribution removed it.
+            Expectation('Rich content', '2020-03-22', absent=True),
+            # Same mechanism: the second "Mixed content" page was a split.
+            Expectation('Normal', 'Mixed content', must_contain_block_kind='table'),
             # --- Backgrounds: unprotected background_color / rule_lines coverage ---
             Expectation('Backgrounds', 'Page color', background_color_set=True),
             Expectation('Backgrounds', 'Page colour and lines', background_color_set=True, rule_lines_set=True),
             Expectation('Backgrounds', 'College Ruled', rule_lines_set=True),
             # --- Section-name corruption regression (already-public repro) ---
             Expectation('Coma, Test', 'Test, test'),
-            # NOTE: no "Password protected" section entry yet — with no real
-            # content in that section beyond the generic placeholder page,
-            # there's nothing content-correct to assert until checklist item
-            # C (protected equation / page background / rule-lines) is
-            # authored. Add real Expectation entries here once it exists;
-            # they'll only actually verify anything once
-            # ONENOTE_TOOL_TEST_PW_TEST_PROTECTED is also set locally.
+            # --- Password protected: same pages as Normal, encrypted. Only
+            # verifies anything once ONENOTE_TOOL_TEST_PW_TEST_PROTECTED is set.
+            Expectation('Password protected', '5 images', must_contain_block_kind='image'),
+            Expectation('Password protected', 'Ink drawing', must_contain_block_kind='ink'),
+            Expectation('Password protected', 'Multi floating-box page', min_regions=6),
+            Expectation('Password protected', 'Floating box sizes', min_regions=4),
+            Expectation('Password protected', '2. Real audio files', must_contain_block_kind='audio'),
+            Expectation('Password protected', '3. Real video files', must_contain_block_kind='video'),
+            Expectation('Password protected', 'Table', must_contain_block_kind='table'),
+            Expectation('Password protected', 'Lot of text', must_contain_text='ReBarUEFI'),
         ],
         scale_check=ScaleCheck(min_page_count=50, min_section_count=12),
     ),
     CorpusFile(
         filename='DIY.onepkg',
-        scale_check=ScaleCheck(min_page_count=425, min_section_count=22),
+        scale_check=ScaleCheck(min_page_count=340, min_section_count=22),
     ),
     CorpusFile(
         filename='Shared.onepkg',
@@ -98,7 +103,7 @@ CORPUS: list[CorpusFile] = [
         # carrying a resolved `data-author` attribute; well under half of
         # that as the floor, same margin-below-observed convention as the
         # page/section counts above.
-        scale_check=ScaleCheck(min_page_count=1131, min_section_count=66, min_resolved_authors=5000),
+        scale_check=ScaleCheck(min_page_count=917, min_section_count=66, min_resolved_authors=5000),
     ),
 ]
 

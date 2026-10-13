@@ -15,34 +15,51 @@ Exported names other modules in this package rely on:
 - `OneDocment`, `check_valid`, `_pyonenote_filenode` — re-exported (as `None`
   if unavailable) so other modules can `from . import _patches` without a
   separate availability check of their own.
-- `_active_shadow`, `_active_decrypt` — single-slot lists coordinating a
+- `_active_decrypt` — single-slot list coordinating a
   password-verified re-parse (see `parser.parse_one_file`). Defined
   unconditionally (not inside the try/except below) so importing them never
   fails just because `pyOneNote` itself is missing.
 
-Concurrency note: `_active_shadow`/`_active_decrypt`/`_active_expected_jcid`
-are plain single-slot lists, NOT thread-local or async-safe. This whole
-pipeline is meant to run synchronously, one `.one` file at a time, never
-concurrently within a process. If you need concurrent conversion, run
-multiple processes, not multiple threads/tasks sharing one interpreter.
+Concurrency note: `_active_decrypt`/`_active_marker_probe` are
+thread-local single-slot holders, so parses in different threads don't see
+each other's state. A parse is fully synchronous, so asyncio tasks sharing
+a thread can't interleave inside one either.
 """
 from __future__ import annotations
 
 import io
 import struct
+import threading
 import uuid
 
 from . import decrypt as onenote_decrypt
 
+class _ThreadSlot(threading.local):
+    """A per-thread single value, indexed like a one-element list
+    (`slot[0]`) so call sites read the same as a plain list would."""
+
+    def __init__(self, default):
+        self._value = default
+
+    def __getitem__(self, index):
+        if index != 0:
+            raise IndexError(index)
+        return self._value
+
+    def __setitem__(self, index, value):
+        if index != 0:
+            raise IndexError(index)
+        self._value = value
+
+
 # Set unconditionally so these are always importable regardless of whether
 # pyOneNote itself is available — see module docstring.
-_active_shadow = [None]
-_active_decrypt = [None]
+_active_decrypt = _ThreadSlot(None)
 # When True, `_filenode_init` skips PropertySet construction entirely (see
 # its own comment) — used for `parser.parse_one_file`'s first,
 # marker-detection-only pass over a section, before it's known whether the
 # file is password-protected.
-_active_marker_probe = [False]
+_active_marker_probe = _ThreadSlot(False)
 
 
 class PyOneNoteUnavailable(RuntimeError):
@@ -169,7 +186,7 @@ try:  # pyOneNote is a required dependency at parse time, but importing
     # instead of a `read` — same cursor effect (needed so sibling
     # properties in the same PropertySet keep resolving at the right
     # offset), none of the copy cost. Scoped strictly to probe mode: normal
-    # parses (including pass 2's real shadow-decrypted read) are untouched.
+    # parses (including pass 2's real decrypted read) are untouched.
     _orig_prt_four_bytes_init = _pyonenote_filenode.PrtFourBytesOfLengthFollowedByData.__init__
 
     def _capped_prt_four_bytes_init(self, file, propertySet):
@@ -219,13 +236,6 @@ try:  # pyOneNote is a required dependency at parse time, but importing
     # property set pyOneNote never reads — so every TextRunFormatting/ParagraphStyle
     # reference resolved to nothing. Read those property sets too and surface them.
     _orig_filenode_init = _pyonenote_filenode.FileNode.__init__
-
-    # Raw jcid int of the FileNode currently constructing its propertySet (set
-    # just before, reset right after) — lets _ospropset_init's Attempt 2 know
-    # what KIND of object it's scanning for when the generic scan fails, so a
-    # title-specific rescue pass can require the actual expected property
-    # (CachedTitleString) instead of accepting any plausible-looking neighbor.
-    _active_expected_jcid = [None]
 
     def _filenode_init(self, file, document):
         # This node's OWN position — structural/plaintext regardless of
@@ -316,7 +326,7 @@ try:  # pyOneNote is a required dependency at parse time, but importing
             # one section — for values that get thrown away unconditionally:
             # either the file turns out protected (this pass's decoded
             # values are ciphertext garbage no caller ever reads — pass 2
-            # rebuilds everything through the shadow buffer) or unprotected
+            # rebuilds everything with decryption on) or unprotected
             # (`parse_one_file` reruns this same construction with this flag
             # off, since THAT'S the only pass an unprotected file gets).
             # This `return` only skips the EXTRA PropertySet construction
@@ -342,7 +352,6 @@ try:  # pyOneNote is a required dependency at parse time, but importing
         if ref is None or jcid is None or not getattr(jcid, 'IsPropertySet', False):
             return
         cur = file.tell()
-        _active_expected_jcid[0] = jcid.jcid
         try:
             file.seek(ref.stp)
             self.propertySet = _pyonenote_filenode.ObjectSpaceObjectPropSet(file, document)
@@ -350,17 +359,128 @@ try:  # pyOneNote is a required dependency at parse time, but importing
             pass  # e.g. ArrayOfPropertyValues (0x10) unimplemented -> skip this object
         finally:
             file.seek(cur)
-            _active_expected_jcid[0] = None
 
     _pyonenote_filenode.FileNode.__init__ = _filenode_init
+
+    # A page's object space holds several revisions, each in a revision
+    # context: the default context (no context id, or a nil one) is the
+    # page as it is now. Every other context is an older snapshot from the
+    # page's version history — a complete copy of the page (its own
+    # PageNode, TitleNode, PageMetaData, text runs ...) — or one shared
+    # context of version-history bookkeeping (jcidVersionHistoryMetaData,
+    # jcidVersionProxy). Verified on real notebooks: every page has exactly
+    # one default-context revision, older snapshots hold the page's earlier
+    # titles (e.g. "Breaks" for a page now titled "Pidurid"), and OneNote's
+    # own MHT export contains only the default-context content. Snapshots
+    # are often more than half of a section's declarations; mixing them in
+    # is what produced stale titles, content landing on the wrong page and
+    # the revision-duplicate pages the dedup passes in parser.py fight.
+    _REVISION_START_TYPES = ('RevisionManifestStart4FND', 'RevisionManifestStart6FND', 'RevisionManifestStart7FND')
+    _NIL_UUID = uuid.UUID(int=0)
+
+    def _fnl_nodes(file_node_list):
+        for fragment in file_node_list.fragments:
+            yield from fragment.fileNodes
+
+    _FILE_DATA_DECL_TYPES = ('ObjectDeclarationFileData3RefCountFND', 'ObjectDeclarationFileData3LargeRefCountFND')
+
+    def _collect_propset_nodes(node, out):
+        # Property-set nodes, plus embedded-file data declarations (no
+        # property set of their own, but revision-scoped the same way).
+        if hasattr(node, 'propertySet') or node.file_node_header.file_node_type in _FILE_DATA_DECL_TYPES:
+            out.append(node)
+        for child in node.children:
+            for n in _fnl_nodes(child):
+                _collect_propset_nodes(n, out)
+
+    def _xguid_key(xguid):
+        if xguid is None or xguid.guid == _NIL_UUID:
+            return None
+        return (xguid.guid, xguid.n)
+
+    def _current_revision_nodes(revision_list):
+        """Property-set nodes of one revision manifest list's current
+        revision: the last default-context revision (or the one a
+        RevisionRole*DeclarationFND assigns the default role to), followed
+        by its ridDependent chain with already-seen identities skipped."""
+        revisions = {}
+        order = []
+        cur = None
+        role_rid = None
+        for n in _fnl_nodes(revision_list):
+            ntype = n.file_node_header.file_node_type
+            data = getattr(n, 'data', None)
+            if ntype in _REVISION_START_TYPES:
+                base = getattr(data, 'base', data)
+                cur = {
+                    'rid': _xguid_key(base.rid),
+                    'dep': _xguid_key(base.ridDependent),
+                    'ctx': _xguid_key(getattr(data, 'gctxid', None)),
+                    'nodes': [],
+                }
+                order.append(cur)
+                if cur['rid'] is not None:
+                    revisions[cur['rid']] = cur
+            elif ntype in ('RevisionRoleDeclarationFND', 'RevisionRoleAndContextDeclarationFND'):
+                base = getattr(data, 'base', data)
+                if base.RevisionRole == 1 and _xguid_key(getattr(data, 'gctxid', None)) is None:
+                    role_rid = _xguid_key(base.rid)
+            elif cur is not None:
+                _collect_propset_nodes(n, cur['nodes'])
+        current = revisions.get(role_rid) if role_rid is not None else None
+        if current is None:
+            defaults = [r for r in order if r['ctx'] is None]
+            current = defaults[-1] if defaults else None
+        if current is None:
+            # No default-context revision at all — unexpected; keep everything
+            # rather than drop the object space.
+            return [n for r in order for n in r['nodes']]
+        result, seen, visited = [], set(), set()
+        while current is not None and id(current) not in visited:
+            visited.add(id(current))
+            for n in current['nodes']:
+                inner = getattr(n.data, 'base', n.data)
+                decl = getattr(inner, 'body', inner)
+                key = str(getattr(decl, 'oid', id(n)))
+                if key not in seen:
+                    seen.add(key)
+                    result.append(n)
+            current = revisions.get(current['dep']) if current['dep'] is not None else None
+        return result
+
+    def _current_propset_nodes(self):
+        """`(node, object_space_id)` for every property-set node in the
+        current revision of each object space (`object_space_id` is None
+        for a node outside any object space)."""
+        nodes = []
+        for top in _fnl_nodes(self.root_file_node_list):
+            if top.file_node_header.file_node_type != 'ObjectSpaceManifestListReferenceFND':
+                found = []
+                _collect_propset_nodes(top, found)
+                nodes.extend((n, None) for n in found)
+                continue
+            space = str(top.data.gosid.guid)
+            for space_list in top.children:
+                for n in _fnl_nodes(space_list):
+                    found = []
+                    if n.file_node_header.file_node_type != 'RevisionManifestListReferenceFND':
+                        _collect_propset_nodes(n, found)
+                    else:
+                        for revision_list in n.children:
+                            found.extend(_current_revision_nodes(revision_list))
+                    nodes.extend((m, space) for m in found)
+        return nodes
 
     def _get_properties(self):
         if self._properties:
             return self._properties
-        nodes = []
-        OneDocment.traverse_nodes(self.root_file_node_list, nodes, [])
+        nodes = _current_propset_nodes(self)
         self._properties = []
-        for node in nodes:
+        self._current_file_identities = {
+            str(node.data.oid) for node, _space in nodes
+            if node.file_node_header.file_node_type in _FILE_DATA_DECL_TYPES
+        }
+        for node, space in nodes:
             ps = getattr(node, 'propertySet', None)
             data = getattr(node, 'data', None)
             if ps is None or data is None:
@@ -389,12 +509,25 @@ try:  # pyOneNote is a required dependency at parse time, but importing
                     # callers that know a property's raw ID can still read it
                     # directly.
                     'body': ps.body,
+                    # The object space (page, or section-level space) this
+                    # declaration lives in — a structural page membership
+                    # signal, see parser's `page_of_space`.
+                    'space': space,
                 })
             except Exception:
                 pass
         return self._properties
 
     OneDocment.get_properties = _get_properties
+
+    def _current_file_identities(self):
+        """Identities of embedded-file declarations in each object space's
+        current revision (an older page snapshot can hold an attachment the
+        page no longer has)."""
+        self.get_properties()
+        return self._current_file_identities
+
+    OneDocment.current_file_identities = _current_file_identities
 
     # pyOneNote bug fix: `OneDocment.get_files()` keys its own dict by the
     # file-data blob's OWN storage guid, and for each declaration
@@ -475,77 +608,75 @@ try:  # pyOneNote is a required dependency at parse time, but importing
 
     OneDocment.get_json = _safe_get_json
 
-    # pyOneNote raises NotImplementedError on property type 0x10 (ArrayOfPropertyValues)
-    # mid-way through reading an object's property set, which aborts the ENTIRE .one
-    # file (every page in the section is lost). Each object's property set is read at
-    # an absolute offset and the caller restores the file cursor afterwards, so a
-    # partially-read set is safe: stop gracefully at the unsupported property and pad
-    # the rest, and the rest of the section keeps parsing. Loses only the trailing
-    # properties of the one object that contains the array.
-    _orig_propset_init = _pyonenote_filenode.PropertySet.__init__
+    # pyOneNote's PropertySet reader doesn't implement the two nested types:
+    # 0x10 (ArrayOfPropertyValues) raises NotImplementedError, and 0x11
+    # (a single nested PropertySet) calls `PropertySet(file)` with four
+    # required arguments missing. Either one aborted the object, and every
+    # property after it was lost. That mattered more than it looks: a
+    # paragraph with a note tag (To Do, Important, ...) carries
+    # `NoteTagStates`, an ArrayOfPropertyValues, BEFORE its text, so every
+    # tagged paragraph silently lost its text (verified on a real notebook:
+    # a whole page of To Do items converted to nothing). This reader
+    # implements every type per [MS-ONESTORE] 2.6.6-2.6.9; nested sets read
+    # their own ObjectID/ObjectSpaceID/ContextID references from the same
+    # streams as the outer set, in order.
+    def _read_propset(self, file, OIDs, OSIDs, ContextIDs, document):
+        fn = _pyonenote_filenode
+        self.current = file.tell()
+        self.cProperties, = struct.unpack('<H', file.read(2))
+        self.indent = ''
+        self.document = document
+        self.current_revision = document.cur_revision
+        self._formated_properties = None
+        self.rgPrids = [fn.PropertyID(file) for _ in range(self.cProperties)]
+        self.rgData = []
+        for prid in self.rgPrids:
+            ptype = prid.type
+            if ptype == 0x1:
+                self.rgData.append(None)
+            elif ptype == 0x2:
+                self.rgData.append(prid.boolValue)
+            elif ptype in (0x3, 0x4, 0x5, 0x6):
+                size = {0x3: 1, 0x4: 2, 0x5: 4, 0x6: 8}[ptype]
+                data = file.read(size)
+                if len(data) != size:
+                    raise struct.error('truncated property value')
+                self.rgData.append(data if ptype != 0x3 else data[:1])
+            elif ptype == 0x7:
+                self.rgData.append(fn.PrtFourBytesOfLengthFollowedByData(file, self))
+            elif ptype in (0x8, 0x9, 0xA, 0xB, 0xC, 0xD):
+                count = 1
+                if ptype in (0x9, 0xB, 0xD):
+                    count, = struct.unpack('<I', file.read(4))
+                stream = OIDs if ptype in (0x8, 0x9) else OSIDs if ptype in (0xA, 0xB) else ContextIDs
+                self.rgData.append(fn.PropertySet.get_compact_ids(stream, count))
+            elif ptype == 0x10:
+                count, = struct.unpack('<I', file.read(4))
+                items = []
+                if count:
+                    element = fn.PropertyID(file)
+                    if element.type != 0x11 or count > _MAX_PLAUSIBLE_ID_COUNT:
+                        raise ValueError('implausible ArrayOfPropertyValues')
+                    for _ in range(count):
+                        child = fn.PropertySet.__new__(fn.PropertySet)
+                        _read_propset(child, file, OIDs, OSIDs, ContextIDs, document)
+                        items.append(child)
+                self.rgData.append(items)
+            elif ptype == 0x11:
+                child = fn.PropertySet.__new__(fn.PropertySet)
+                _read_propset(child, file, OIDs, OSIDs, ContextIDs, document)
+                self.rgData.append(child)
+            else:
+                raise ValueError('rgPrids[i].type is not valid')
 
-    # cProperties is a raw u16 (up to 65535) — landing on a misaligned/garbage
-    # shadow position can make it claim tens of thousands of properties, and
-    # the vendor loop below has no cap, so it burns real wall-clock time
-    # (measured: tens of seconds on a real ~30MB section) reading and
-    # discarding PropertyID after PropertyID before the except-branch throws
-    # the whole thing away anyway. A real OneNote object has at most a
-    # handful to a few dozen properties, never hundreds — peek cProperties
-    # BEFORE paying for that loop and short-circuit to the same degenerate
-    # empty result the exception handler already produces.
-    _MAX_PLAUSIBLE_CPROPERTIES = 300
-
-    def _implausible_cprops(buf: bytes, start: int) -> bool:
-        head = buf[start:start + 2]
-        if len(head) < 2:
-            return True
-        return struct.unpack('<H', head)[0] > _MAX_PLAUSIBLE_CPROPERTIES
-
-    def _propset_init(self, *args, **kwargs):
-        file = args[0] if args else kwargs.get('file')
-        shadow = _active_shadow[0]
-        if shadow is not None and file is not None:
-            # The only genuinely-encrypted part of a protected file is each
-            # PropertySet's own body (see decrypt.py) — everything else
-            # (FileNode headers, ObjectDeclaration/jcid/oid, chunk
-            # references) is real plaintext and must keep reading from the
-            # ORIGINAL file. Redirect just this read to the decrypted shadow
-            # buffer at the same offset, then resync the real file's cursor
-            # to wherever the shadow read left off (encryption is length-
-            # preserving, so offsets in both buffers always agree).
-            start = file.tell()
-            if _implausible_cprops(shadow, start):
-                # Same degenerate result the except-branch below produces,
-                # without paying for the loop — feed the real constructor a
-                # stream that reports cProperties=0 itself so it still sets
-                # every OTHER attribute (current_revision, indent, ...) the
-                # normal way, just correctly-fast instead of correctly-slow.
-                _orig_propset_init(self, io.BytesIO(b'\x00\x00'), *args[1:], **kwargs)
-                self.current = start
-                file.seek(start + 2)
-                return
-            shadow_stream = io.BytesIO(shadow)
-            shadow_stream.seek(start)
-            shadow_args = (shadow_stream,) + args[1:]
-            try:
-                _orig_propset_init(self, *shadow_args, **kwargs)
-            except (NotImplementedError, ValueError, AttributeError, TypeError, struct.error):
-                read = len(getattr(self, 'rgData', []) or [])
-                self.rgPrids = getattr(self, 'rgPrids', [])[:read]
-                self.cProperties = read
-            finally:
-                file.seek(shadow_stream.tell())
-            return
+    def _propset_init(self, file, OIDs, OSIDs, ContextIDs, document):
         try:
-            _orig_propset_init(self, *args, **kwargs)
+            _read_propset(self, file, OIDs, OSIDs, ContextIDs, document)
         except (NotImplementedError, ValueError, AttributeError, TypeError, struct.error):
             # AttributeError: a stream (e.g. ContextIDs) that a property type
             # expects turns out to be None — happens when reading into an
             # encrypted property-set body with no password supplied (see the
             # encryption-key fix above) — or genuinely corrupt data.
-            # TypeError: pyOneNote's own nested-PropertySet handler (property
-            # type 0x11) calls `PropertySet(file)` with 4 required args missing
-            # — a genuine pre-existing bug, independent of encryption.
             # Keep only the fully-read (prid, value) pairs; truncate the count so
             # get_properties() iterates just those (padding with None would crash
             # its struct.unpack on typed values).
@@ -555,303 +686,78 @@ try:  # pyOneNote is a required dependency at parse time, but importing
 
     _pyonenote_filenode.PropertySet.__init__ = _propset_init
 
-    # ObjectSpaceObjectPropSet reads its OIDs/OSIDs/ContextIDs compact-id
-    # streams directly off `file`, BEFORE constructing the PropertySet body —
-    # those streams live in the same encrypted region as the property values
-    # that reference them (a run's ObjectSpaceID-typed "which page am I on"
-    # property, an image's PictureContainer reference, ...). The PropertySet
-    # patch above only redirects the body itself; without also redirecting
-    # here, every ID resolved through OIDs/OSIDs/ContextIDs stays garbage even
-    # once the property VALUES decrypt correctly, so runs/images never
-    # resolve to a page group. Same shadow-buffer swap, one level up.
+    # Nested sets (types 0x10/0x11, above) surface in get_properties() as
+    # their own decoded dicts (a list of dicts for 0x10) instead of the
+    # vendor's str() of the object.
+    _orig_propset_get_properties = _pyonenote_filenode.PropertySet.get_properties
+
+    def _propset_get_properties(self):
+        if self._formated_properties is not None:
+            return self._formated_properties
+        nested = {}
+        for i, data in enumerate(self.rgData):
+            if isinstance(data, _pyonenote_filenode.PropertySet):
+                nested[i] = data
+                self.rgData[i] = b''
+            elif isinstance(data, list) and data and isinstance(data[0], _pyonenote_filenode.PropertySet):
+                nested[i] = data
+                self.rgData[i] = []
+        try:
+            props = _orig_propset_get_properties(self)
+        finally:
+            for i, data in nested.items():
+                self.rgData[i] = data
+        for i, data in nested.items():
+            name = str(self.rgPrids[i])
+            if name == 'Unknown':
+                continue
+            props[name] = [d.get_properties() for d in data] if isinstance(data, list) else data.get_properties()
+        return props
+
+    _pyonenote_filenode.PropertySet.get_properties = _propset_get_properties
+
+    # pyOneNote's name table registers NoteTagStates as 0x04003489, but the
+    # real id carries the ArrayOfPropertyValues type bits: 0x40003489.
+    _pyonenote_filenode.PropertyID._property_id_name_mapping[0x40003489] = 'NoteTagStates'
+
+    # A password-protected section encrypts each ObjectSpaceObjectPropSet's
+    # PropertySet body individually (see decrypt.py's `decrypt_object_body`
+    # for the exact framing, verified 100% against every object in a real
+    # protected section). The OIDs/OSIDs/ContextIDs compact-id streams in
+    # front of it stay plaintext; the body itself is replaced by a uint32
+    # ciphertext length plus that many bytes of ciphertext. Read the ID
+    # streams normally, decrypt the body into its own buffer, and parse the
+    # PropertySet from that.
     _orig_ospropset_init = _pyonenote_filenode.ObjectSpaceObjectPropSet.__init__
 
-    class _EmptyIDStream:
-        """Stand-in for a missing OIDs/OSIDs/ContextIDs stream (see Attempt 2
-        below, where the real one was never read): `.read()` behaves like
-        `_object_stream_read` at end-of-stream (returns None) so an
-        ObjectID/ObjectSpaceID/ContextID-typed property just resolves to
-        None instead of crashing PropertySet.__init__ and losing every
-        property that comes after it in the same object."""
-
-        def read(self):
-            return None
-
-    _EMPTY_ID_STREAM = _EmptyIDStream()
-
-    class _ReplayIDStream:
-        """A REAL OIDs/OSIDs/ContextIDs stream, pre-read (see
-        `_read_plaintext_id_streams` below) — `.read()` replays its
-        CompactIDs in order, same sequential-consumption contract as
-        `_object_stream_read`, so `PropertySet.__init__`'s OID/ObjectSpaceID/
-        ContextID-typed property resolution gets the ACTUAL referenced
-        object instead of `_EmptyIDStream`'s permanent None."""
-
-        def __init__(self, items):
-            self._items = items
-            self._head = 0
-
-        def read(self):
-            if self._head < len(self._items):
-                v = self._items[self._head]
-                self._head += 1
-                return v
-            return None
-
-    def _read_plaintext_id_streams(file, start, document):
-        """OIDs/OSIDs/ContextIDs compact-id streams turn out to be
-        STRUCTURAL, not content — real plaintext even for a protected
-        object, same as everything else in this module that isn't a
-        PropertySet's own property VALUES (FileNode headers, jcid/oid,
-        chunk references, and now this). Verified empirically, not by
-        inspection: Attempt 1 (below) reads these same 3 streams through the
-        SHADOW (decrypted) buffer and gets implausible garbage counts every
-        time — decrypting already-plaintext bytes with AES produces noise,
-        which is exactly the "implausible stream count" failure Attempt 1
-        always hits. Reading them from the REAL file instead, at the same
-        object start Attempt 1 already uses, gives small, consistent,
-        genuinely-valid counts (confirmed: the SAME 2-OID/no-OSID/no-Context
-        shape recurred across a dozen unrelated real objects in a real
-        file) whose resolved ExtendedGUIDs are real, plausible object
-        references — this is what finally makes `ParagraphStyle`/
-        `TextRunFormatting`/`PictureContainer` resolve for protected content
-        at all, previously undocumented as even possible.
-
-        Returns `(oids, osids, ctxids)` (each a list of CompactID, `osids`/
-        `ctxids` empty when their stream isn't present) or None if the
-        plaintext at `start` doesn't parse as this structure (caller falls
-        back to the pre-existing empty-stream behavior, unchanged).
-        """
-        try:
-            cur = file.tell()
-            file.seek(start)
-            oids_hdr = _pyonenote_filenode.ObjectSpaceObjectStreamHeader(file)
-            if oids_hdr.Count > _MAX_PLAUSIBLE_ID_COUNT:
-                return None
-            oids = [_pyonenote_filenode.CompactID(file, document) for _ in range(oids_hdr.Count)]
-            osids = []
-            if not oids_hdr.OsidStreamNotPresent:
-                osids_hdr = _pyonenote_filenode.ObjectSpaceObjectStreamHeader(file)
-                if osids_hdr.Count > _MAX_PLAUSIBLE_ID_COUNT:
-                    return None
-                osids = [_pyonenote_filenode.CompactID(file, document) for _ in range(osids_hdr.Count)]
-            ctxids = []
-            if oids_hdr.ExtendedStreamsPresent:
-                ctx_hdr = _pyonenote_filenode.ObjectSpaceObjectStreamHeader(file)
-                if ctx_hdr.Count > _MAX_PLAUSIBLE_ID_COUNT:
-                    return None
-                ctxids = [_pyonenote_filenode.CompactID(file, document) for _ in range(ctx_hdr.Count)]
-            return oids, osids, ctxids
-        except Exception:
-            return None
-        finally:
-            file.seek(cur)
-
-    def _propset_known_score(body) -> int:
-        """How many of a decoded PropertySet's own properties resolved to a
-        real (non-'Unknown') name — a cheap, purely-structural signal of
-        "did we actually land on a real PropertySet", used below to tell a
-        correct decrypt apart from decrypted-garbage that happens not to
-        raise (e.g. a small cProperties by chance)."""
-        if body is None:
-            return 0
-        return sum(1 for p in getattr(body, 'rgPrids', []) if str(p) != 'Unknown')
-
-    _SHADOW_REALIGN_WINDOW = 128
-    _SHADOW_REALIGN_MIN_SCORE = 2
-
-    def _score_shadow_body_at(shadow, off) -> int:
-        """Cheap structural peek: does `shadow[off:]` look like a PropertySet
-        body (cProperties, rgPrids) on its own, no OIDs/OSIDs/ContextIDs
-        prefix? Scores by how many prids resolve to a real property name."""
-        if off < 0 or off + 2 > len(shadow):
-            return -1
-        cprops, = struct.unpack('<H', shadow[off:off + 2])
-        if not (0 < cprops <= 32):
-            return -1
-        pos = off + 2
-        known = 0
-        for _ in range(cprops):
-            if pos + 4 > len(shadow):
-                return -1
-            val, = struct.unpack('<I', shadow[pos:pos + 4])
-            if val in _pyonenote_filenode.PropertyID._property_id_name_mapping:
-                known += 1
-            pos += 4
-        return known
-
-    # Reverse-looked-up (not hardcoded) so this stays correct if pyOneNote's
-    # own tables ever change: jcidPageMetaData's raw jcid, and
-    # CachedTitleString's raw property id — used by the title-rescue scan
-    # below.
-    _JCID_PAGE_META_DATA = next(
-        (k for k, v in _pyonenote_filenode.JCID._jcid_name_mapping.items() if v == 'jcidPageMetaData'), None,
-    )
-    _PRID_CACHED_TITLE_STRING = next(
-        (k for k, v in _pyonenote_filenode.PropertyID._property_id_name_mapping.items() if v == 'CachedTitleString'),
-        None,
-    )
-    _TITLE_RESCUE_WINDOW = 4096
-
-    def _scan_contains_prid(shadow, off, target_prid) -> bool:
-        """Same cheap structural peek as `_score_shadow_body_at`, but asks a
-        narrower question: is `target_prid` specifically among this
-        candidate's property ids? Used only by the title-rescue scan, where
-        "some plausible-looking properties" isn't enough evidence — a
-        neighboring, unrelated object's body can score just as well by
-        chance (verified: a real false positive here, `LastModifiedTime`/
-        `OffsetFromParentHoriz`/... with no title, outscored the genuine
-        title's position when the window was widened) — but only the REAL
-        title object will ever have `CachedTitleString`."""
-        if off < 0 or off + 2 > len(shadow):
-            return False
-        cprops, = struct.unpack('<H', shadow[off:off + 2])
-        if not (0 < cprops <= 32):
-            return False
-        pos = off + 2
-        for _ in range(cprops):
-            if pos + 4 > len(shadow):
-                return False
-            val, = struct.unpack('<I', shadow[pos:pos + 4])
-            if val == target_prid:
-                return True
-            pos += 4
-        return False
-
-    def _rescue_title_scan(shadow, start):
-        """A wider (4096-byte) scan used ONLY for `jcidPageMetaData` objects
-        that the normal 128-byte Attempt-2 scan couldn't place — gated by
-        REQUIRING `CachedTitleString` specifically among the candidate's own
-        properties, not just a plausible-looking score, which is what makes
-        widening the window safe here when it wasn't safe generically (see
-        `_scan_contains_prid`'s docstring). Returns the first matching
-        offset or None."""
-        for d in range(_TITLE_RESCUE_WINDOW):
-            off = start + d
-            if _scan_contains_prid(shadow, off, _PRID_CACHED_TITLE_STRING):
-                return off
-        return None
-
     def _ospropset_init(self, file, document):
-        shadow = _active_shadow[0]
-        if shadow is None:
+        decrypt_ctx = _active_decrypt[0]
+        if decrypt_ctx is None:
             _orig_ospropset_init(self, file, document)
             return
+        info, file_key = decrypt_ctx
         start = file.tell()
-
-        # Attempt 1: the normal OIDs -> OSIDs -> ContextIDs -> body chain,
-        # read from the decrypted shadow buffer at the same offset as the
-        # real file (correct when a protected object still uses the same
-        # framing an unprotected file would).
-        shadow_stream = io.BytesIO(shadow)
-        shadow_stream.seek(start)
         try:
-            _orig_ospropset_init(self, shadow_stream, document)
-            if _propset_known_score(getattr(self, 'body', None)) > 0:
-                file.seek(shadow_stream.tell())
-                return
-        except Exception:
-            pass
-
-        # Attempt 2: empirically, a protected object's real content is NOT
-        # always reachable via that same OIDs/OSIDs/ContextIDs framing at
-        # `ref.stp` — the genuinely-encrypted region for these objects turns
-        # out to start a short, small distance further in, as a bare
-        # PropertySet body with no ID-stream prefix at all (verified against
-        # a real protected section: this recovers real CachedTitleString /
-        # RichEditTextUnicode / ParagraphStyle content that Attempt 1 can't
-        # reach). Scan a small forward window for the first position that
-        # looks like a real property set (mostly-recognized property names,
-        # not just a plausible-looking count) and use that instead.
-        #
-        # The OIDs/OSIDs/ContextIDs streams THEMSELVES are structural
-        # plaintext (see `_read_plaintext_id_streams`) even though the body
-        # scanned for above is real ciphertext — read them from the real
-        # file at this object's own start, same position Attempt 1 already
-        # tried (and failed at, because it read them through the WRONG,
-        # shadow/decrypted buffer instead). When this succeeds, an OID/
-        # ObjectSpaceID/ContextID-typed property (ParagraphStyle,
-        # TextRunFormatting, PictureContainer, ...) resolves to the real
-        # referenced object instead of unconditionally None — previously
-        # undocumented as even possible, confirmed empirically against a
-        # real file. Falls back to the empty stub, unchanged, if this
-        # object's plaintext doesn't parse as this structure.
-        real_ids = _read_plaintext_id_streams(file, start, document)
-
-        best_off, best_score = None, 0
-        for d in range(_SHADOW_REALIGN_WINDOW):
-            s = _score_shadow_body_at(shadow, start + d)
-            if s > best_score:
-                best_score, best_off = s, start + d
-
-        # A title whose CachedTitleString didn't turn up in the normal
-        # (narrow, generic) scan gets ONE more chance: a much wider scan
-        # that's safe specifically BECAUSE it requires CachedTitleString by
-        # name, not just a plausible score — see `_rescue_title_scan`'s
-        # docstring for the real false positive this guard was built to
-        # reject. Only attempted for objects the caller (`_filenode_init`)
-        # already knows are a jcidPageMetaData declaration.
-        if (
-            _active_expected_jcid[0] == _JCID_PAGE_META_DATA
-            and _PRID_CACHED_TITLE_STRING is not None
-            and not (best_off is not None and _scan_contains_prid(shadow, best_off, _PRID_CACHED_TITLE_STRING))
-        ):
-            rescued = _rescue_title_scan(shadow, start)
-            if rescued is not None:
-                best_off, best_score = rescued, max(best_score, _SHADOW_REALIGN_MIN_SCORE)
-
-        if best_off is not None and best_score >= _SHADOW_REALIGN_MIN_SCORE:
-            # Build with the plaintext-derived real ID streams AND with the
-            # empty stub, then keep whichever actually decoded MORE
-            # properties (`cProperties` reflects how far the read got before
-            # any truncating exception — see `_propset_init`'s own graceful-
-            # truncation contract). Necessary safety net, not paranoia:
-            # verified real regression on a real file — the real-ID-stream
-            # read is only validated against the simple 2-OID text-run shape
-            # it was found with; for other object shapes (images, titles,
-            # ...) a real-but-WRONG-for-this-object stream can make an
-            # OID/ObjectSpaceID-typed property misbehave partway through and
-            # truncate the object early, losing content the empty-stream
-            # path decoded fine. Comparing after the fact means real streams
-            # only ever help, never regress.
-            # One shared stream, reseeked before each attempt — avoids
-            # copying the whole (possibly tens-of-MB) shadow buffer twice
-            # per object; `io.BytesIO(shadow)` was already a known hot-path
-            # cost here even before this change (see the cProperties-cap
-            # performance fix above).
-            cand_stream = io.BytesIO(shadow)
-
-            def _try_build(oids, osids, ctx):
-                cand_stream.seek(best_off)
-                try:
-                    return _pyonenote_filenode.PropertySet(cand_stream, oids, osids, ctx, document), oids, osids, ctx
-                except Exception:
-                    return None
-
-            candidates = []
-            if real_ids is not None:
-                real_streams = tuple(_ReplayIDStream(x) for x in real_ids)
-                built = _try_build(*real_streams)
-                if built is not None:
-                    candidates.append(built)
-            built_empty = _try_build(_EMPTY_ID_STREAM, _EMPTY_ID_STREAM, _EMPTY_ID_STREAM)
-            if built_empty is not None:
-                candidates.append(built_empty)
-
-            if candidates:
-                body, oids, osids, ctx = max(candidates, key=lambda c: getattr(c[0], 'cProperties', 0))
-                self.OIDs = oids
-                self.OSIDs = osids
-                self.ContextIDs = ctx
-                self.body = body
-                return
-
-        # Attempt 3: not every object declaration in a protected section
-        # actually sits inside the encrypted region (some structural/shared
-        # ones stay real plaintext) — if nothing above panned out, fall back
-        # to reading it as-is instead of aborting the whole file's parse.
-        file.seek(start)
-        _orig_ospropset_init(self, file, document)
+            oids = _pyonenote_filenode.ObjectSpaceObjectStreamOfIDs(file, document)
+            osids = None
+            if not oids.header.OsidStreamNotPresent:
+                osids = _pyonenote_filenode.ObjectSpaceObjectStreamOfIDs(file, document)
+            ctx = None
+            if oids.header.ExtendedStreamsPresent:
+                ctx = _pyonenote_filenode.ObjectSpaceObjectStreamOfIDs(file, document)
+            cb, = struct.unpack('<I', file.read(4))
+            body = onenote_decrypt.decrypt_object_body(file.read(cb), info, file_key)
+        except (ValueError, struct.error):
+            body = None
+        if body is None:
+            # Not an encrypted body after all — read it as plaintext.
+            file.seek(start)
+            _orig_ospropset_init(self, file, document)
+            return
+        self.OIDs = oids
+        self.OSIDs = osids
+        self.ContextIDs = ctx
+        self.body = _pyonenote_filenode.PropertySet(io.BytesIO(body), oids, osids, ctx, document)
 
     _pyonenote_filenode.ObjectSpaceObjectPropSet.__init__ = _ospropset_init
 

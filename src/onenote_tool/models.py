@@ -101,6 +101,9 @@ class PageResult:
     # One of: 'narrow_lines', 'college_ruled', 'standard_rules', 'wide_ruled',
     # 'small_grid', 'medium_grid', 'large_grid', 'very_large_grid', or None.
     rule_lines: Optional[str] = None
+    # Color of the rule lines ('#rrggbb'), set whenever `rule_lines` is —
+    # OneNote's default is '#caebfd' (light blue).
+    rule_line_color: Optional[str] = None
 
 
 @dataclass

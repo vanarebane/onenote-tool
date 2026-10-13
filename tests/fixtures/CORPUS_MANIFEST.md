@@ -33,28 +33,20 @@ As of the last real-file run (see "Ground truth" below): 50 pages across
   `Floating box sizes` (4 regions, region size verification), `2. Real audio
   files` / `3. Real video files` (real `<audio>`/`<video>` attachments, each
   with an image-preview icon alongside).
-- **`Password protected` section** (1 page) — protected, `password_status`
-  starts as `needs_password` until a real password is supplied via env var
-  (see `corpus_manifest.py`). **Currently the ONLY content in this section
-  is a single generic page** — this is where checklist item C (protected
-  math equation + page background color + rule-line page) should land once
-  authored; see the main plan for what to add.
-- **`Rich content` section** (6 pages) — the "interesting real-world content"
+- **`Password protected` section** (20 pages) — an encrypted copy of
+  `Normal`, same page titles and content. Without its password (env var,
+  see `corpus_manifest.py`) it is one `needs_password` placeholder page and
+  its expectations skip; with it, it must convert identically to `Normal`.
+- **`Rich content` section** (5 pages) — the "interesting real-world content"
   section. `Section page 1` (a citation-styled paragraph with its own
   distinct font-size — the "silently-dropped font size" regression case),
-  `Random large table` (2 tables), `2020-03-22` (the revision-duplicate
-  **spurious page** repro — a page that shouldn't semantically exist,
-  documented at length in known-limitations.md; content is scattered
-  table-cell fragments, not a real authored page — do not "fix" its content,
-  its EXISTENCE alongside the real pages is the regression signal),
-  `Image single`, **`Rename title third time`** (a page renamed multiple
-  times — the real-world repro for the page-title old/new-ambiguity ⚠️ row;
-  already exists, no new authoring needed for checklist item B),
-  `Embedded objects` (mixed image+text+file page). One page in this section
-  already produces a `failed:equation` report entry — a math equation
-  already exists in a NORMAL section (Table A's "Normal: ⚠️ placeholder"
-  row is already covered); only the PROTECTED-section equation row is still
-  genuinely untested.
+  `Random large table` (2 tables), `Image single`, **`Rename title third
+  time`** (a page renamed multiple times — its old titles live in
+  version-history snapshots, see known-limitations.md), `Embedded objects`
+  (mixed image+text+file page). This section used to also produce a
+  spurious `2020-03-22` page (stray table-cell fragments); the manifest now
+  asserts it's absent. `Normal`'s `Mixed content` page holds the one real
+  equation (binomial theorem), which converts to MathML.
 - **`Backgrounds` section** (13 pages) — one page per built-in rule-line
   pattern (`None`, `Narrow Lines`, `College Ruled`, `Standard Rules`,
   `Wide Ruled`, `Small/Medium/Large/Very Large Grid`, `Coloured lines`) plus
@@ -76,7 +68,7 @@ As of the last real-file run (see "Ground truth" below): 50 pages across
 
 ## `DIY.onepkg` — large real hobbyist notebook (electronics/PC-building/making)
 
-~258MB, notebook name `DIY`, 22 sections across 3 groups, 425 pages. Used as
+~258MB, notebook name `DIY`, 22 sections across 3 groups, 340 pages (425 before version-history snapshots were excluded). Used as
 a scale/crash-resilience check, not fine-grained content assertions (real
 personal notebook — page/section titles beyond what's already public via
 `CHANGELOG.md` aren't reproduced here). One section is named `Skills, Tools`
@@ -90,7 +82,7 @@ new content needed.
 
 ## `Shared.onepkg` — large real multi-author notebook (~220MB)
 
-66 sections across 6 groups, 1131 pages, synced between 2 real users over
+66 sections across 6 groups, 917 pages (1131 before version-history snapshots were excluded), synced between 2 real users over
 years — the "different shape of complexity" stress file (more revision
 generations, more concurrent-edit history than a single-author notebook).
 Originally surfaced 2 real parser crashes (`FileNode` object has no
@@ -121,9 +113,9 @@ exist today, before any checklist item (A–D) content is added:
 
 | File | page_count | sections | notable `report.failed` keys already covered |
 |---|---:|---:|---|
-| `Test.onepkg` | 50 | 12 | `equation`(normal only), `image_ext.emf`, `file.emf`, `file.zip/xlsx/f3d/f3z/ogg/wav/mp4/wmv/webm`, `image_missing_data`, `password_protected_section:needs_password` |
-| `DIY.onepkg` | 425 | 22 | `image_ext.emf`, `file.emf`, `image_ext.xps`, `file.xps`, `image_duplicate`, `file_duplicate` |
-| `Shared.onepkg` | 1131 | 66 | `image_ext.emf`, `file.emf`, `image_ext.tmp`, `file.tmp`, `password_protected_section:needs_password` — **zero `section_parse_error`** |
+| `Test.onepkg` (with the test password) | 66 | 12 | `image_ext.emf`, `file.emf` |
+| `DIY.onepkg` | 340 | 22 | `image_ext.emf`, `file.emf`, `image_ext.xps`, `file.xps`, `image_duplicate`, `file_duplicate` |
+| `Shared.onepkg` | 917 | 66 | `image_missing_data`, `image_duplicate`, `image_ext.emf`, `file.emf`, `image_ext.tmp`, `file.tmp`, `password_protected_section:wrong_password` — **zero `section_parse_error`** |
 
 Re-run `python -c` against `onenote_tool.convert.convert_onepkg(path)` (or
 `onenote-tool convert <path>` with the `[cli]` extra) and diff against this

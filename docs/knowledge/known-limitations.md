@@ -421,17 +421,13 @@ identical except for the one intentional, verified-correct merge (the
 spurious "Untitled page" table duplicate, above) — no other regressions
 found.
 
-**Not fully closed by this fix**: a run/outline box whose own structural
-path back to ANY page is missing entirely (not just to the WRONG page —
-genuinely absent from `_page_regions`'s own walk too) has no signal this
-mapping can recover, since there's nothing to index. Confirmed still
-present on real files after this fix (the "2020-03-22" spurious page
-in the bundled test notebook, holding scattered table-cell fragments; the
-"ESP32 WiFi radar"/"Untitled page" split above specifically). This is a
-deeper case of the same revision-store duplication family documented at
-the top of this file — not attempted further for the same standing
-reason: no verified, non-guessing signal was found to close it, and this
-project doesn't land page-attribution fixes without one.
+**Not fully closed by this fix — since closed**: a run or outline box with
+no structural path back to any page (the "2020-03-22" spurious page in the
+bundled test notebook, holding scattered table-cell fragments) had no
+signal this mapping could use. The object-space attribution described in
+"Revision-store duplication" below gives one: every declaration lives in
+its page's own object space, so it no longer depends on references at all.
+That page is gone, and its fragments are in their real table.
 
 ## `pyOneNote` is version-pinned, not `>=`
 
@@ -445,15 +441,13 @@ quietly regressing parse quality with no error at all). Loosening this pin
 needs re-verifying every patch in `_patches.py` against the new version
 first — don't just bump it.
 
-## Not thread-safe / not reentrant
+## Thread safety
 
-`_patches.py`'s `_active_shadow`/`_active_decrypt`/`_active_expected_jcid`
-are plain single-slot module-level lists, not thread-local or async-safe.
-The whole pipeline is designed to run synchronously, one `.one` file at a
-time, one call at a time, within a process. Calling into this package
-concurrently from multiple threads/async tasks in the same interpreter can
-cross-contaminate state between unrelated parses. If you need concurrency,
-use multiple OS processes, not multiple threads.
+`_patches.py`'s parse state (`_active_decrypt`, `_active_marker_probe`) is
+thread-local, so parsing different files in different threads is safe —
+verified: four sections (two protected) parsed concurrently give the same
+output as parsing them one after another. A parse is synchronous, so
+asyncio tasks sharing a thread can't interleave inside one.
 
 ## Importing this package has a process-wide side effect
 
@@ -464,40 +458,59 @@ will observe these patches too. This is deliberate (it's the only way to
 fix real bugs/gaps in a third-party library without forking it), but worth
 knowing if you're debugging something that touches `pyOneNote` directly.
 
-## Revision-store duplication can misattribute content, even unprotected
+## Revision-store duplication: root cause found and fixed
 
-OneNote's revision-store duplication (see
-[onenote-file-format.md](onenote-file-format.md)) reaches the main,
-unprotected pipeline too, via `page_title_by_guid`'s title dedup:
+Every page is its own object space, and each object space keeps several
+revisions, each in a *revision context*. Only the default context (no
+context id) is the page as it is now. The others are:
 
-- **Still open**: a renamed page can leave both its old and new title text
-  in the file under the exact same identity tuple, with no reliable signal
-  to tell which is current — `page_title_by_guid`'s first-occurrence-wins
-  picks correctly on some pages and stalely on others in the *same* file.
-  Not attempted: a same-guid counter-example (a page whose title legitimately
-  needed the *first* occurrence, not the last) was found on the same test
-  file this was investigated against, ruling out a blind
-  first-wins-to-last-wins flip.
-- **Still open, confirmed at real scale**: a page's own text runs can carry
-  a `TextRunFormatting` reference pointing at a DIFFERENT page's guid
-  entirely (not just a stale revision of their own page) — the run's text
-  is correctly extracted, just grouped under the wrong page. Confirmed on a
-  real ~250MB notebook: a page whose own heading read "Bugs" (a real
-  checklist of "To Do"-tagged bug reports, verified present in the
-  notebook's own MHT export) converted to **zero body blocks** — every one
-  of its checklist items had a `TextRunFormatting` pointing at a
-  *different, unrelated* page's guid, and duplicate declarations of the
-  exact same run identity resolved to two DIFFERENT guids (one self,
-  one foreign) depending on which revision-duplicate got processed. The
-  content isn't lost — it lands on the OTHER page instead (verified: a
-  page titled "ToDo" absorbed checklist items whose own text visibly
-  belongs to several different, separately-titled pages, "Power" among
-  them) — but the per-page split is wrong. This is the exact "sibling
-  consensus" shape 0.1.0 tried and broke worse (below) — no fix attempted
-  here for the same reason: don't guess at cross-page attribution without
-  a verified, non-regressing signal. A page converting to an unexpectedly
-  low block count with a plausible-looking title is the practical symptom
-  to watch for if this needs revisiting.
+- one per older version of the page (OneNote's page version history): a
+  complete snapshot with its own PageNode, TitleNode, PageMetaData and text,
+  often more than half of all declarations in a section;
+- one shared context (`7111497f-1b6b-4209-9491-c98b04cf4c5a`) holding
+  version-history bookkeeping (`jcidVersionHistoryMetaData`,
+  `jcidVersionProxy`).
+
+pyOneNote reads every declaration in every revision into one flat list.
+That single fact explains the problems this section used to list as open:
+a renamed page's old and new titles under one identity (the old one is in a
+snapshot), runs carrying another page's guid, and spurious extra pages.
+Verified on real notebooks: every page has exactly one default-context
+revision, the snapshots hold the earlier titles (e.g. "Breaks" for a page
+now titled "Pidurid"), and OneNote's own MHT export contains only
+default-context content.
+
+Fixed in two parts:
+
+1. `_patches._get_properties` reads only each object space's current
+   revision — the default-context revision (or the one a
+   `RevisionRole*DeclarationFND` assigns the default role), plus its
+   `ridDependent` chain, with identities already seen skipped.
+2. Each property records the object space it came from, and
+   `parser.parse_one_file` assigns a declaration to the page whose object
+   space it lives in (`page_of_space`). The reference-derived guesses
+   (`_run_guid` from `TextRunFormatting`, `PictureContainer`, iteration
+   order) only fill in for declarations outside any page's object space.
+
+Measured against OneNote's own MHT export, by page title and word recall:
+
+| | before | after |
+|---|---|---|
+| Test.onepkg pages / tool-only titles | 69 / 1 | 66 / 0 |
+| DIY.onepkg pages (MHT: 325, some sections not exported) | 425 | 340 |
+| DIY word recall / precision vs MHT | 0.900 / 0.926 | 0.960 / 0.948 |
+| Shared.onepkg pages (no MHT available) | 1131 | 917 |
+
+Words that disappeared from the Shared notebook were checked: they exist
+only in version-history snapshots, i.e. text the user had since deleted.
+The same goes for attachments: a file that only an old snapshot still has
+was removed from its page, and is no longer reported as a failed import.
+The "2020-03-22" spurious page and the duplicate "Mixed content" page in
+the test notebook are gone (the corpus manifest now asserts both).
+
+Still open: a page made of several floating boxes is read box by box in the
+page's own box order, while the MHT export orders them by position — e.g. a
+box of To Do items can come before a heading that sits above it.
 
 **Tried and reverted (0.1.1): a "sibling consensus" run-grouping override.**
 An earlier version of this package (0.1.0) had `parser.parse_one_file` build
@@ -709,7 +722,7 @@ keep.
 Fixed properly in `_patches.py`'s `OneDocment.files_by_identity()` (an
 additional method, `get_files()` itself is left untouched — the password-
 decryption path still needs it called exactly where it already is, inside
-the shadow-decrypt context window its lazy `FileDataStoreObject` read
+the decrypt context window its lazy `FileDataStoreObject` read
 depends on): index **both directions** directly — every declaration's own
 `(oid -> blob guid)` pair, not just the last one per blob — then resolve
 `oid -> bytes` through that. A strict superset of what `get_files()` alone
@@ -739,36 +752,24 @@ file: 2 of 22 pages differ, both gaining a previously-unresolvable audio/
 video preview thumbnail — `embedded_preview` 6 -> 9, `image_missing_data`
 3 -> 0 on that file) — no regressions found anywhere.
 
-## Math equations: detected, replaced with an honest placeholder
+## Math equations: MathML for verified structures, placeholder otherwise
 
-OneNote's inline equation editor doesn't store a typeset formula — it
-stores plain Unicode text (the real math glyphs, e.g. italic 𝑥/𝑎/𝑛/𝑘) mixed
-with structural control characters from Microsoft's UnicodeMath "linear
-format" (fraction/superscript/radical delimiters drawn from the
-U+FDD0–FDEF noncharacter range — reserved by Unicode itself to never be
-assigned a real glyph, invisible or shown as tofu in any real font),
-flagged via `MathFormatting` on the run's character-style object
-(`jcidParagraphStyleObjectForText`, referenced through `TextRunFormatting`
-same as every other run-level style override). Rendering that text as-is,
-which this tool used to do, produced exactly that: real math glyphs glued
-together with literal noncharacter soup. Verified on a real file (the
-binomial theorem expansion) and cross-checked against the MHT ground
-truth — which turns out not to help here either: OneNote's own MHT export
-doesn't attempt a text/MathML form of an equation, it rasterizes it to a
-PNG (`<img src=...>`), same as it does for some other content this tool
-can't match pixel-for-pixel.
+An equation run's text is RichEdit's internal math form: the glyphs plus
+U+FDD0 (start of a math object), U+FDEE (argument separator) and U+FDEF
+(end of object). The text doesn't say what each object is. That's in the
+run's `TextRunData` — an ArrayOfPropertyValues, readable only since the
+nested-property-set fix below — with one nested set per text run (run
+boundaries in `TextRunIndex`). The run that starts an object carries its
+type (`0x1400344F`) and its operator/delimiter characters (`0x10003453`,
+`0x10003454`). The type values are RichEdit's own math object types (TOM:
+`tomBrackets` 13, `tomNary` 21, `tomStack` 27, `tomSuperscript` 31, ...).
 
-Given no fraction/superscript layout engine exists here to interpret those
-delimiters, and matching OneNote's own raster-image fallback isn't
-feasible without a math typesetting engine, `parser._run_is_equation`
-detects `MathFormatting` and swaps in the same visible-placeholder
-convention used for every other genuinely-unsupported element
-(`rendering._placeholder_run`, tracked via `report.fail('equation')`).
-Stripping just the delimiter characters and keeping the bare glyphs was
-considered and rejected: flattening a nested formula loses which delimiter
-meant "start of an exponent" vs. "start of the whole fraction", so the
-result would read as a *plausible but wrong* formula — worse than an
-honest "not supported" marker, not better.
+`equations.equation_mathml` turns that into MathML for the four types
+verified against the real test equation (the binomial theorem): brackets,
+n-ary operator with limits, stack (binomial coefficient) and superscript.
+An equation containing any other type keeps the placeholder, so no layout
+is guessed. Adding a type needs one real sample to confirm its argument
+order. OneNote's own MHT export rasterizes equations, so it isn't a check.
 
 ## Page background color / rule lines: implemented, verified against 13 real pages
 
@@ -805,57 +806,20 @@ visualize it (a solid CSS background, an actual grid/ruled-line pattern
 image, neither) is a choice for the caller, same reasoning already used for
 `PageRegion`'s x/y/width/height.
 
-## Rule-line COLOR (separate from the page-color/rule-line-pattern above): not found, future work
+## Rule-line color: found, implemented
 
-OneNote's "Rule Lines" submenu has its own **Rule Line Colour** picker,
-independent of both page color and the ruled/grid pattern above (an 18-swatch
-named palette — <none>/Light Blue (default)/Blue/Yellow/Green/Red/Purple/
-Cyan/Orange/Magenta/Blue Mist/Purple Mist/Tan/Lemon Lime/Apple/Teal/Red
-Chalk/Silver). Two real test pages confirm it's a genuine, independent
-per-page setting: "Coloured lines" (body text: *"This page has orange
-colored lines"*) and "Page colour and lines" (screenshotted directly by the
-user: pale-red page color + body text *"This page has 'Red' colour and
-lines with 'Red Chalk' colour"*) — same rule-line pattern (`college_ruled`)
-as plain "College Ruled", same or absent page-color as their siblings, but
-a visibly different line tint neither `rule_lines` nor `background_color`
-above accounts for.
+OneNote's "Rule Line Colour" setting is property `0x14001CD5` on the page's
+`jcidPageNode`: an ARGB uint32 (little-endian, so the bytes are B, G, R, A),
+written on every page that has rule lines. Verified on the 13-page test
+section: every page with the default color reads `0xFFCAEBFD` (light blue),
+"Coloured lines" (orange) reads `0xFFF8E0C8`, the "Red Chalk" page
+`0xFFF8DCDC`, and pages without rule lines have no value. Exposed as
+`PageResult.rule_line_color` (`'#rrggbb'`).
 
-**Exhaustively searched, not found**, in two independent passes:
-
-1. A full key-by-key diff of "College Ruled" (default line color) against
-   "Coloured lines" (orange) — every raw PropertyID on their respective
-   `jcidPageNode` objects, not just the unnamed ones `_page_style` already
-   reads. Identical key sets; the only value differences are structural
-   refs and timestamps.
-2. A whole-file scan of every unnamed ("Unknown"-named) PropertyID across
-   all 13 real pages in the test section, looking for anything whose
-   occurrence count matched "exactly the pages known to override the
-   default line color" (2). Nothing did — every unnamed property found
-   is already accounted for by `rule_lines`/`background_color` above or by
-   unrelated per-object bookkeeping (author records, revision counters).
-
-Also disproved, along the way, this project's own earlier guess from before
-this test data existed: an unnamed `jcidPageMetaData` property
-(`0x1C0035CD`) once suspected of being a page-theme/style reference turns
-out to be a monotonically-increasing per-notebook counter (a fixed 16-byte
-prefix + a trailing value that increases by 4 on every single page in
-creation order) — unrelated to color, confirmed now that real comparative
-data across many pages exists to check it against.
-
-**Conclusion**: rule-line color isn't a property of the page's own object
-space at all. Left as real future work — the next things worth trying, in
-order of likely payoff: (a) check whether it's stored in the *notebook's*
-own metadata rather than per-page, since the palette's "default" checkmark
-(Light Blue) suggests a notebook- or app-level default that a page might
-only override via a *reference* rather than an inline value; (b) check
-whether it hangs off the page's outline/canvas structure object instead of
-`jcidPageNode` directly; (c) get a raw byte-level diff of two `.one` files
-that are identical except for this one setting (the fastest path, if a
-contributor can produce one) rather than continuing to reason from the
-already-decoded property names. Not attempted: guessing a value from the
-palette's swatch position (e.g. "Orange" = index 8) and shipping it
-unverified — same standing rule as everywhere else in this file, a property
-whose real storage location is unconfirmed doesn't get landed on a guess.
+Two earlier exhaustive searches missed it. Both diffed decoded properties
+at a time when the parser mixed in version-history snapshots and truncated
+any object after an ArrayOfPropertyValues (see below), so this value never
+showed a clean per-page difference.
 
 ## Table-cell formatting had a real, now-fixed performance cost
 
@@ -875,7 +839,7 @@ fixed**: parsing the password-protected section alone took ~39s. Root
 cause, found via `cProfile` on `parse_one_file`'s first pass in isolation
 (the marker-detection-only pass — reads every `FileNode` on the raw,
 still-encrypted bytes just to learn whether the section carries an
-`ObjectDataEncryptionKeyV2FNDX` marker, before any password/shadow-decrypt
+`ObjectDataEncryptionKeyV2FNDX` marker, before any password/decrypt
 work even starts): a type-0x7 property (`PrtFourBytesOfLengthFollowedByData`
 — a variable-length blob) decodes its 4-byte length prefix from ciphertext
 too, so on real encrypted content that length comes out as near-random
@@ -890,91 +854,38 @@ by the FileNode's own type, not by any property value) — so during this
 pass specifically, `_patches.py` now `seek`s past the claimed length
 instead of reading it (same cursor effect for sibling properties, none of
 the copy cost). Scoped strictly to the marker-probe pass via the existing
-`_active_marker_probe` flag; the real shadow-decrypt second pass, and every
+`_active_marker_probe` flag; the real decrypting second pass, and every
 unprotected-file parse, are untouched. Verified byte-identical
 `PageResult` output (all three real test sections) and unchanged
 `password_status` (`needs_password`/`wrong_password` cases included) before
 vs. after, by toggling just this one patch in isolation. Real-file result:
 **~39s to ~1.7s** for the password-protected section.
 
-## Password-protected recovery has a real, not-yet-closed ceiling
+## Password-protected sections: full parity with a correct password
 
-Even with a **verified correct** password:
+With a verified correct password, a protected section decrypts exactly (see
+[ms-offcrypto-encryption.md](ms-offcrypto-encryption.md) for the format)
+and goes through the same pipeline as an unprotected one. Verified against
+the test notebook's protected section and its unprotected twin: identical
+output for all 20 pages — text and formatting, lists, tables (incl. merged
+cells and cell images), links, YouTube embeds, ink, author attribution,
+image and attachment bytes, `page.regions`, dates, background/rule lines,
+page levels.
 
-- Roughly half of page titles can fail to decode on a harder real file
-  (surfaced as `Untitled page N` rather than a wrong name — never silently
-  dropped, but not the real title either).
-- Text formatting (bold/color/headings/etc.) only renders where the
-  underlying style object happens to decode — not universal, no known way
-  to force it currently.
-- **Lists**: implemented and verified — `recovery._pages_from_structural_groups`
-  now builds the same `jcidOutlineElementNode` → `ListNodes` → `NumberListFormat`
-  mapping the normal pipeline uses, reading it from `by_id` instead of the
-  raw `props` list. Real, partial recovery on the same test file: a page
-  that previously rendered as entirely flat paragraphs now has one real
-  `<ol>`/`<ul>` item. Bounded by the usual per-object decode ceiling, not by
-  missing wiring — on that file, ~47% of `jcidOutlineElementNode` and ~25%
-  of `jcidNumberListNode` objects decoded a non-empty property set; an item
-  whose own membership object didn't decode still renders as a plain
-  paragraph rather than being dropped.
-- **Tables**: wired in the same way (`_structural_page_groups` now also
-  clusters `jcidTableNode` declarations, reusing the normal pipeline's own
-  `rendering._resolve_table_grid`) but **confirmed non-functional on the
-  test file available**: every `jcidTableNode` property set — all 6, across
-  both protected sections tested — decoded completely empty (`val == {}`),
-  not partially like text/lists. This isn't a wiring gap; the object's own
-  body isn't recoverable via the existing 3-attempt decode chain on this
-  file, more severely than any other object type checked so far (plausibly
-  because a table's own properties lean more heavily on the same
-  unreliable OID-stream reference resolution than a plain text run's do —
-  unconfirmed, no smaller test case has isolated it). The code is left in
-  (degrades to silently contributing nothing, exactly like an unset list
-  item does) rather than reverted, since it's inert-safe and would start
-  working automatically if this decode ceiling is ever improved — but
-  don't expect real tables from protected content today.
-- **Page indent level**: implemented and verified — `_pages_from_structural_groups`
-  now reads the same `PageMetaData.PageLevel` property the normal pipeline
-  does. Recovered a real secondary-level (indented) page correctly on the
-  test file. Found and fixed a real garbage-decode case while verifying
-  this: a misaligned protected-content decrypt landed `PageLevel` on
-  unrelated ciphertext and decoded to `3334854043` rather than failing
-  cleanly — `_page_sub_level` now clamps anything outside 1–20 back to
-  top-level instead of propagating a nonsensical `sub_level`. (The normal
-  pipeline reads the identical property with no such clamp — never
-  observed to need one there; protected content's 3-attempt decode chain
-  is where misaligned reads like this actually happen.)
-- **Audio/video attachments**: verified against real files — `.wav`/`.ogg`
-  (audio) and `.mp4`/`.webm`/`.wmv` (video) all classified correctly by
-  `images._attachment_kind` in a protected section, byte-for-byte matching
-  their filenames' declared sizes. What's *not* verified by this — and
-  known to still be affected by the pre-existing structural-clustering
-  spillover documented above — is which PAGE a given attachment lands on;
-  a real audio file was observed bleeding onto a neighboring page's group
-  in exactly the shape already described for text/images.
-- **YouTube embeds**: wired in (reuses `images._youtube_from_rtu`, the same
-  detector the normal pipeline uses) but **not verified against real
-  decoded data** — the one real YouTube link in the test file used for this
-  never decoded at all (`RichEditTextUnicode` came back empty), the usual
-  partial ceiling, not a new failure. Deliberately does NOT attempt
-  thumbnail-perceptual-hash matching to a nearby embedded preview image
-  (unlike the normal pipeline) — `_pages_from_structural_groups`'s own
-  images don't compute a `dhash`, and matching logic on top of already-
-  unverified input would be a second layer of guessing; the embed still
-  renders correctly without a matched thumbnail, just falling back to
-  YouTube's own thumbnail client-side.
-- The floating-box canvas layout (`page.regions`) is still not
-  reconstructed at all for protected content (see
-  [Documentation.md](../Documentation.md)'s progress table) — not yet
-  attempted.
-- Exact page count on a **wrong** password is unrecoverable — page titles
-  are encrypted too, and the revision-store duplication described in
-  [onenote-file-format.md](onenote-file-format.md) makes it impossible to
-  reliably dedupe stale title copies without readable content to compare.
+What remains:
 
-See [recovery-techniques-log.md](recovery-techniques-log.md) for the full
-trail of what's been tried against each of these — several "obvious" fixes
-turned out to be real regressions on closer testing, so read that before
-attempting one of the above.
+- Only one real protected section with a known password has been tested.
+  The format was consistent across all 2203 objects in it, but a section
+  saved by a different OneNote version, or with a different cipher in its
+  `<encryption>` descriptor, hasn't been seen.
+- With **no** or a **wrong** password, nothing past the structure is
+  readable: the section becomes one placeholder page (`password_status`
+  `needs_password` / `wrong_password`). Page titles are encrypted too, so
+  even the page count isn't recoverable.
+- `recovery._flat_recover_protected_pages` (structural page recovery built
+  for the old, partial decryption) is now only a fallback for a section
+  that decrypts but yields no pages through the normal pipeline. It hasn't
+  been hit on any real file since the exact decryption landed.
 
 ## Canvas/layout position: exposed via `page.regions`, normal sections only
 
@@ -1004,28 +915,10 @@ guid that happens to be unique enough for *page*-level lookups is not
 automatically unique enough for anything with more than one instance per
 page.
 
-Not implemented for password-protected-section recovery — `regions` is
-always `[]` there. **Actually tried, not just skipped**: the safest
-possible approach was tested directly — calling `ordering._page_regions`
-(the SAME tree-walk the normal pipeline uses, zero new heuristics) against
-a real protected file's already-decrypted `props`/`by_id`, once a copy of
-the real 6-box multi-region test page existed in a protected section
-specifically to check this. Result: not a single page's `jcidPageNode`
-decoded with more than one outline-box child reference intact anywhere in
-the file. The chain needed is 5 objects deep — `jcidPageManifestNode` →
-`jcidPageNode` → `jcidOutlineNode` → `jcidOutlineElementNode` →
-`jcidRichTextOENode` — each with its own independent ~20-50% decode
-ceiling (see the lists/tables findings above); getting all five to decode
-together for even one multi-box page never happened. `jcidOutlineNode`
-itself decoded standalone often enough (19/106, ~18%, on the same file) to
-theoretically report SOME box positions, but with no reliable way to
-attribute content to a specific one of them (recovery's structural
-clustering only correlates content to a PAGE, not a box within it — that's
-the actual missing piece, and it's the same shape of heuristic-layering
-that caused the "sibling consensus" regression), building anything from
-that would mean shipping positions with empty or guessed content — worse
-than not having `regions` at all. Left as: confirmed hard, not attempted
-further. `blocks` remains authoritative for content either way; `regions`
+Password-protected sections get `regions` too, the same way (earlier
+partial decryption never recovered the object chain it needs; exact
+decryption does). `blocks` remains authoritative for content either way;
+`regions`
 is a purely additive, best-effort second view when it's available at all.
 
 ## YouTube thumbnail matching needs network access
@@ -1033,12 +926,30 @@ is a purely additive, best-effort second view when it's available at all.
 `images._youtube_thumb_hashes` makes a real outbound HTTP request (to
 `img.youtube.com`) to perceptually match an embedded preview image to the
 actual YouTube thumbnail. This is the **only** network call anywhere in
-this package, and it's fully optional/best-effort — wrapped in its own
-try/except, degrading gracefully (the embed just doesn't get pre-matched
-to a specific image, and would load its thumbnail from YouTube client-side
-instead) if there's no network access or the request fails. There is
-currently no way to disable this call explicitly if you want to guarantee
-zero network access — it fails closed on its own, but doesn't fail fast.
+this package, and it's best-effort — a failure just leaves the embed
+without a matched preview. Turn it off with `ONENOTE_TOOL_OFFLINE=1` (or
+`onenote-tool convert --offline`).
+
+## pyOneNote dropped every property after a nested property set
+
+pyOneNote's PropertySet reader doesn't implement property type 0x10
+(ArrayOfPropertyValues — raises) or 0x11 (a nested PropertySet — calls the
+constructor with four arguments missing). The object was truncated there
+and every later property lost. A paragraph with a note tag carries
+`NoteTagStates` (an ArrayOfPropertyValues) before its text, so **every
+tagged paragraph silently lost its text** — on a real notebook, a whole page
+of To Do items converted to nothing. `_patches._read_propset` implements all
+types per [MS-ONESTORE] 2.6.6–2.6.9 (nested sets read their object/space/
+context references from the parent's streams, in order), and
+`get_properties()` returns nested sets as dicts. pyOneNote's name table also
+had NoteTagStates under the wrong id (`0x04003489`; the real id carries the
+type bits, `0x40003489`).
+
+Note tags are now rendered too (`rendering._note_tags`): label and shape from
+the tag's `jcidNoteTagSharedDefinitionContainer`, checked state from
+`ActionItemStatus` bit 0 (agrees with a non-zero `NoteTagCompleted` on all
+~390 real tags checked). Shape 3 is the checkbox in every real To Do-style
+tag seen (four labels, two languages).
 
 ## Recycle-bin / deleted-page content: `.onepkg` export doesn't carry it
 
@@ -1158,15 +1069,10 @@ found the real structural chain:
   can't be resolved (the 0.1% gap above) gets no attribute at all — the
   same "never guess" fallback the row already specified before this was
   implemented.
-- **Protected sections: tried, hits the same decode ceiling as everything
-  else there, worse than most.** Against a real protected section (correct
-  password supplied), only 38 of 602 `jcidOutlineElementNode`s even carried
-  the `AuthorOriginal` reference at all, and every one of those 38 pointed
-  at a `jcidReadOnlyPersistablePropertyContainerForAuthor` that itself never
-  decoded a real `Author` string — 0/564 real text runs resolved. Not a
-  bug in the new code; a real object failing to decode under encryption is
-  the same failure shape already documented for protected lists/tables
-  above.
+- **Protected sections: same result as unprotected.** With exact
+  decryption the protected test section resolves the same `data-author`
+  values as its unprotected twin. (The earlier partial decryption resolved
+  0/564.)
 - **Table cells: wired in, verified.** A cell's own text runs are collected
   by a separate walk (`rendering._collect_cell_runs`, reached via
   `_resolve_table_grid`/`_resolve_cell_html`) that didn't originally have

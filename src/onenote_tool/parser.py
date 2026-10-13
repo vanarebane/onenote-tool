@@ -17,7 +17,7 @@ from typing import Optional
 
 from . import decrypt as onenote_decrypt
 from . import ink as onenote_ink
-from ._patches import OneDocment, _active_decrypt, _active_marker_probe, _active_shadow, check_valid, require_pyonenote
+from ._patches import OneDocment, _active_decrypt, _active_marker_probe, check_valid, require_pyonenote
 from .images import (
     _DHASH_THUMB_MATCH, _FILE_PLACEHOLDER, _IMAGE_EXTS, _IMAGE_PLACEHOLDER, _IMAGE_TYPES,
     _attachment_kind, _build_embedded_file, _build_page_image, _dham, _same_image, _youtube_from_rtu,
@@ -28,10 +28,11 @@ from .ordering import _object_space_order, _page_content_order, _page_regions
 from .recovery import _flat_recover_protected_pages
 from .rendering import (
     _RTU_MARKER, _child_ids, _color_from_bytes, _file_embed_html, _has_visible_content, _image_block_html,
-    _list_is_ordered, _media_block_html, _paragraph_alignment, _placeholder_blocks, _placeholder_run,
+    _list_is_ordered, _media_block_html, _note_tags, _paragraph_alignment, _placeholder_blocks, _placeholder_run,
     _placeholder_text, _resolve_run_format, _resolve_table_grid, _runs_to_paragraphs, _rtu_to_inline_html,
     _table_html,
 )
+from .equations import equation_mathml
 from .stamps import _is_stamp, classify_stamp
 from .text import _clean_text, _clean_title, _extract_guid, _le_int, _norm_identity, decode_run_text
 
@@ -130,28 +131,31 @@ def _page_style(page_node_prop) -> tuple:
     return color, rule_lines
 
 
+# Rule-line color: an ARGB uint32 (little-endian, so bytes are B, G, R, A) on
+# the page's jcidPageNode, written whenever the page has rule lines.
+# Verified on 13 real pages: every page with the default line color reads
+# 0xFFCAEBFD (light blue), "Coloured lines" (orange) 0xFFF8E0C8 and the
+# "Red Chalk" page 0xFFF8DCDC; absent on every page without rule lines.
+_PRID_RULE_LINE_COLOR = 0x14001CD5
+
+
+def _rule_line_color(page_node_prop) -> Optional[str]:
+    body = (page_node_prop or {}).get('body') if page_node_prop else None
+    for prid, data in zip(getattr(body, 'rgPrids', ()), getattr(body, 'rgData', ())):
+        if prid.value == _PRID_RULE_LINE_COLOR and isinstance(data, (bytes, bytearray)) and len(data) == 4:
+            return f'#{data[2]:02x}{data[1]:02x}{data[0]:02x}'
+    return None
+
+
 def _run_is_equation(val, by_id) -> bool:
     """True when this run's `TextRunFormatting` carries `MathFormatting`.
 
-    OneNote's own inline-equation editor doesn't store a typeset formula —
-    it stores plain Unicode text mixed with structural control characters
-    from Microsoft's UnicodeMath "linear format" (superscript/fraction/
-    radical delimiters drawn from the U+FDD0-FDEF noncharacter range,
-    invisible/undefined in any real font), flagged with `MathFormatting`
-    on the run's character-style object. Rendering that text as-is (as this
-    tool used to) produces the formula's real math glyphs interleaved with
-    literal noncharacter soup — confirmed on a real file (the binomial
-    theorem: `x`, `a`, `n`, `k` in math italic, correct in isolation, glued
-    together with the raw delimiter codepoints). There's no fraction/
-    superscript layout engine here to interpret those delimiters properly,
-    and OneNote's own MHT export doesn't attempt a text/MathML form either —
-    it rasterizes the equation to a PNG. A placeholder (same convention as
-    every other genuinely-unsupported element in this codebase) is the
-    honest option; stripping just the delimiters and keeping the bare
-    glyphs was considered and rejected — flattening a nested formula (which
-    delimiter meant "start of exponent" vs. "start of the whole fraction")
-    loses the grouping, and the result reads as a *plausible but wrong*
-    formula instead of visibly-not-a-formula, which is worse."""
+    An equation's text is RichEdit's internal math form (glyphs plus
+    U+FDD0/FDEE/FDEF structure characters), not displayable as-is.
+    `equations.equation_mathml` converts it to MathML when every math object
+    in it is a verified type; otherwise the caller emits a placeholder.
+    Stripping the structure characters and keeping the bare glyphs would
+    read as a plausible but wrong formula, so that is never done."""
     trf_ref = val.get('TextRunFormatting')
     tr_ref = (trf_ref[0] if trf_ref else None) if isinstance(trf_ref, list) else trf_ref
     trf = by_id.get(_norm_identity(tr_ref)) if tr_ref else None
@@ -363,10 +367,6 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
             if file_key is None:
                 wrong_password = True
             else:
-                fh.seek(0)
-                raw = fh.read()
-                shadow = onenote_decrypt.decrypt_package(raw, info, file_key)
-                _active_shadow[0] = shadow
                 _active_decrypt[0] = (info, file_key)
                 try:
                     fh.seek(0)
@@ -386,7 +386,6 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
                     document.get_files()
                     files_by_identity = document.files_by_identity()
                 finally:
-                    _active_shadow[0] = None
                     _active_decrypt[0] = None
         elif not getattr(document, '_saw_encryption_marker', False):
             # Genuinely unprotected — the probe pass above skipped every
@@ -475,7 +474,7 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
         if color or rule_lines:
             guid = (_norm_identity(prop.get('identity')) or '').split(',')[0] or None
             if guid and guid not in page_style_by_guid:
-                page_style_by_guid[guid] = (color, rule_lines)
+                page_style_by_guid[guid] = (color, rule_lines, _rule_line_color(prop) if rule_lines else None)
 
     # List membership: an outline element carrying a ListNodes ref is a list item;
     # its content rich-text run(s) become <li>. Bullet glyph -> <ul>, else <ol>.
@@ -570,6 +569,35 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
         for _r in _regions:
             outline_to_page[_r['guid'].split(',')[0]] = _pg
 
+    # Structural page membership: every page is its own object space, and
+    # each declaration's object space is known (`_patches._get_properties`'s
+    # 'space'). An object space holding a jcidPageNode and exactly one
+    # jcidPageMetaData is a page, keyed by that metadata's base guid (the
+    # same key `page_title_by_guid` uses). Where this is known it decides a
+    # declaration's page outright; the reference-derived guesses below
+    # (`_run_guid`, PictureContainer, iteration order) only fill in for
+    # declarations outside any page space. Verified against OneNote's own
+    # MHT export of real notebooks: removes the stray-fragment pages those
+    # guesses produced (e.g. table-cell runs whose TextRunFormatting points
+    # into another object space) without losing any page.
+    space_meta_guids = {}
+    page_spaces = set()
+    for prop in props:
+        space = prop.get('space')
+        if not space:
+            continue
+        ptype = prop.get('type', '')
+        if ptype == 'jcidPageNode':
+            page_spaces.add(space)
+        elif ptype in _PAGE_META_TYPES:
+            guid = (_norm_identity(prop.get('identity')) or '').split(',')[0]
+            if guid:
+                space_meta_guids.setdefault(space, set()).add(guid)
+    page_of_space = {
+        space: next(iter(guids)) for space, guids in space_meta_guids.items()
+        if space in page_spaces and len(guids) == 1
+    }
+
     groups = OrderedDict()  # guid -> {runs, images, files, date, time}
     image_counter = [0]
     file_counter = [0]
@@ -627,11 +655,14 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
     for prop in props:
         ptype = prop.get('type', '')
         val = prop.get('val', {})
+        space_page = page_of_space.get(prop.get('space'))
+        if space_page:
+            current_guid = space_page
 
         if ptype in _TEXT_TYPES:
             run_id = _norm_identity(prop.get('identity'))
             guid = _run_guid(val)
-            if guid:
+            if guid and not space_page:
                 current_guid = outline_to_page.get(guid, guid)
             if not current_guid:
                 continue
@@ -676,7 +707,15 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
                     grp['runs'].append({'t': '', 'h': '', 'rid': run_id, 'blank': True})
                     report.ok('blank_paragraph')
                 continue
-            if _run_is_equation(val, by_id):
+            is_equation = _run_is_equation(val, by_id)
+            mathml = equation_mathml(prop.get('body')) if is_equation else None
+            if mathml is not None:
+                # Real MathML for an equation built only from verified math
+                # object types (see equations.py); rendered inline in its
+                # paragraph like any other run.
+                inline_html = mathml
+                report.ok('equation')
+            elif is_equation:
                 if run_id is None or run_id not in grp['run_ids']:
                     if run_id is not None:
                         grp['run_ids'].add(run_id)
@@ -716,10 +755,16 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
             author = author_by_run.get(run_id)
             if author:
                 run_entry['author'] = author
+            tags = _note_tags(val, by_id)
+            if tags:
+                run_entry['tags'] = tags
+                report.ok('note_tag', len(tags))
             align = _paragraph_alignment(val.get('ParagraphAlignment'))
             if align:
                 run_entry['align'] = align
-            fmt = _resolve_run_format(val.get('ParagraphStyle'), val.get('TextRunFormatting'), by_id)
+            fmt = None if mathml is not None else _resolve_run_format(
+                val.get('ParagraphStyle'), val.get('TextRunFormatting'), by_id,
+            )
             if fmt is not None:
                 run_entry['fmt'] = fmt
             grp['runs'].append(run_entry)
@@ -766,7 +811,7 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
                     # node's real page object-space (same fact already relied
                     # on for page_style_by_guid/regions above) — defer
                     # assignment the same way images do, preferring it.
-                    own_guid = (own_identity or '').split(',')[0] or None
+                    own_guid = space_page or (own_identity or '').split(',')[0] or None
                     file_records.append((own_guid, current_guid, embedded_file))
                     identity_by_ref[embedded_file.ref] = own_identity
 
@@ -811,7 +856,7 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
                     group_for(current_guid)['runs'].append(_placeholder_run(desc, 'unsupported format or missing data'))
                 continue
             gm = _GUID_RE.search(str(val.get('PictureContainer', '')))
-            page_guid = gm.group(1) if gm else None
+            page_guid = space_page or (gm.group(1) if gm else None)
             fname = str(val.get('ImageFilename') or val.get('EmbeddedFileName') or '').replace('\x00', '').strip()
             dedup_key = (page_guid, fname) if (page_guid and fname) else _extract_guid(val.get('PictureContainer'))
             # Same (page, filename) can hold DIFFERENT pictures (e.g. two
@@ -913,7 +958,7 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
                     # which makes `pages` non-empty below and skips the
                     # protected-recovery fallback entirely — a real
                     # regression this gate prevents.
-                    ink_guid = ident.split(',')[0] or current_guid
+                    ink_guid = space_page or ident.split(',')[0] or current_guid
                     group_for(ink_guid).setdefault('ink_container_ids', []).append(ident)
 
     # Drop any top-level image record whose SAME identity was already
@@ -1060,7 +1105,7 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
                     x=rmeta['x'], y=rmeta['y'], width=rmeta['width'], height=rmeta['height'], blocks=r_blocks,
                 ))
 
-        page_color, page_rule_lines = page_style_by_guid.get(_guid, (None, None))
+        page_color, page_rule_lines, page_rule_line_color = page_style_by_guid.get(_guid, (None, None, None))
         pages.append((
             page_order.get(_guid, 10 ** 9),
             PageResult(
@@ -1074,6 +1119,7 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
                 regions=regions,
                 background_color=page_color,
                 rule_lines=page_rule_lines,
+                rule_line_color=page_rule_line_color,
             ),
         ))
 
@@ -1095,9 +1141,12 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
         fmeta.get('content') for ident, fmeta in files_by_identity.items()
         if ident in consumed_file_idents
     }
+    # Only files the current page versions declare: one that survives only
+    # in an older page snapshot was removed from its page, not lost here.
+    current_files = document.current_file_identities()
     for ident, fmeta in files_by_identity.items():
         ext = (fmeta.get('extension') or '').lower()
-        if ext in _IMAGE_EXTS or ident in consumed_file_idents:
+        if ext in _IMAGE_EXTS or ident in consumed_file_idents or ident not in current_files:
             continue
         content = fmeta.get('content')
         if content in reported_content:
@@ -1109,21 +1158,11 @@ def parse_one_file(path: str, report: ElementReport, passwords: Optional[list] =
     # known order keep their storage position (stable sort).
     pages.sort(key=lambda item: item[0])
 
-    if getattr(document, '_saw_encryption_marker', False) and candidates and not wrong_password:
-        # ALWAYS try structural recovery for a verified-password-protected
-        # section, even when the main per-page pipeline above already found
-        # SOME pages — real regression found and fixed here: reading real
-        # OID/ObjectSpaceID streams (see `_patches._ospropset_init`'s
-        # Attempt 2) lets `_run_guid`/`PictureContainer` SOMETIMES resolve
-        # now, which makes `pages` non-empty and used to skip structural
-        # recovery entirely — but that resolution is still unreliable
-        # per-object (some images' PictureContainer resolves, others don't;
-        # same for page grouping), so the main pipeline's "partial success"
-        # was demonstrably WORSE than structural recovery's comprehensive
-        # result on a real file (images vanished, several pages lost all
-        # content). Structural recovery doesn't depend on any reference
-        # resolving — prefer it whenever it produces anything, regardless
-        # of what the main pipeline did.
+    if not pages and getattr(document, '_saw_encryption_marker', False) and candidates and not wrong_password:
+        # Last resort for a verified-password section whose decrypted
+        # objects still didn't resolve into pages through the normal
+        # pipeline above: structural recovery doesn't depend on any
+        # reference resolving.
         recovered = _flat_recover_protected_pages(document, by_id)
         if recovered:
             report.ok('password_protected_section:flat_recovery', len(recovered))

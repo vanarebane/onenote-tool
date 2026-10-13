@@ -2,8 +2,8 @@
 
 A Python library and CLI for parsing and converting Microsoft OneNote
 `.onepkg` (notebook export) and `.one` (section) files — including
-best-effort content recovery for password-protected sections, which
-Microsoft's own tooling doesn't expose.
+password-protected sections (given the password), which Microsoft's own
+tooling doesn't expose.
 
 This is **not** an official Microsoft project, and it is **lossy by
 design**: OneNote's binary format ([MS-ONESTORE]) is large, partly
@@ -24,9 +24,9 @@ export you give it.
   HTML-per-block format your own code can render however it likes — with an
   optional, additive floating-box layout view (`page.regions`) for an
   application that wants to reproduce OneNote's own free-form canvas.
-- Recovering as much as possible from a **password-protected** section,
-  given the password — OneNote's own export/print tools generally refuse
-  to touch protected content at all.
+- Converting a **password-protected** section, given the password — the
+  same output as an unprotected section. OneNote's own export/print tools
+  generally refuse to touch protected content at all.
 - A quick command-line tool for poking at a notebook's structure while
   developing against it (`onenote-tool inspect`), without writing a script
   each time.
@@ -51,9 +51,9 @@ itself for what each row actually means and what's been verified.
 
 | Software used, date tested | Normal, unprotected | Password-protected |
 |---|:---:|:---:|
-| OneNote (Copilot-integrated Microsoft 365 build), August 2026 | ✅ ~84% supported | ✅ ~23% supported |
-| | ⚠️ ~6% partial | ⚠️ ~45% partial |
-| | ❌ ~10% not supported | ❌ ~32% not supported |
+| OneNote (Copilot-integrated Microsoft 365 build), October 2026 | ✅ ~94% supported | ✅ ~94% supported |
+| | ⚠️ ~3% partial | ⚠️ ~3% partial |
+| | ❌ ~3% not supported | ❌ ~3% not supported |
 
 ## Suggested usage
 
@@ -93,12 +93,11 @@ The full, unvarnished list lives in
 and every specific content type's status is in
 [Documentation.md](https://github.com/vanarebane/onenote-tool/blob/main/Documentation.md)'s progress tables — this is the short version:
 
-- **Password-protected sections don't convert reliably.** Best-effort
-  recovery exists (see "What it's for" above), but it's a real ceiling, not
-  a bug waiting to be fixed — see the capability table above. If you have
-  the notebook open and the password, the most reliable path is removing
-  the password (on the notebook, section, or individual pages) in OneNote
-  itself before exporting.
+- **Password-protected sections are verified against one real section.**
+  With the right password it converts identically to its unprotected copy,
+  but only that one protected section (with a known password) has been
+  tested. Without the password nothing beyond the section's structure is
+  readable — it becomes a single placeholder page.
 - **Deleted content is gone before this tool ever sees it.** A `.onepkg`
   export never contains recycle-bin content — a deleted page or section
   leaves no trace in the file at all. The same applies to most fine-grained

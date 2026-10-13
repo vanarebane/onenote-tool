@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import os
 import re
 import urllib.request
 from typing import Optional
@@ -109,7 +110,10 @@ def _youtube_thumb_hashes(video_id: str):
     failure — this is the one network call in the whole package, and it's
     always optional/best-effort: without it, a YouTube embed just loads its
     thumbnail from YouTube client-side instead of getting matched to an
-    already-embedded preview image."""
+    already-embedded preview image. Setting the environment variable
+    ONENOTE_TOOL_OFFLINE=1 turns it off (`onenote-tool convert --offline`)."""
+    if os.environ.get('ONENOTE_TOOL_OFFLINE', '').strip() not in ('', '0'):
+        return []
     if video_id in _yt_thumb_hash_cache:
         return _yt_thumb_hash_cache[video_id]
     hashes = []

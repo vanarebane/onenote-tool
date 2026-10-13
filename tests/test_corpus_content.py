@@ -41,6 +41,9 @@ def _find_page(result, section_name, page_title):
 
 def _assert_expectation(result, exp: Expectation):
     page = _find_page(result, exp.section, exp.page_title)
+    if exp.absent:
+        assert page is None, f'page {exp.page_title!r} in section {exp.section!r} should not exist'
+        return
     assert page is not None, (
         f'page {exp.page_title!r} not found in section {exp.section!r} '
         f'(sections present: {[s.name for s in result.sections]!r})'
@@ -115,5 +118,8 @@ def _expectation_cases():
 def test_corpus_expectation(local_corpus_dir, corpus_file, expectation):
     # xfail entries run this SAME assertion — a fix flips them to XPASS
     # (visible, non-fatal since strict=False) instead of a silent pass.
+    env_var = corpus_file.password_env.get(expectation.section)
+    if env_var and not os.environ.get(env_var):
+        pytest.skip(f'{env_var} not set — protected section {expectation.section!r} cannot be decrypted')
     result = _converted(corpus_file, local_corpus_dir)
     _assert_expectation(result, expectation)

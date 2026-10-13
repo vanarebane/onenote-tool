@@ -175,3 +175,12 @@ def test_build_blocks_audio_file_icon_still_renders_as_standalone_image():
 
     kinds = [b['kind'] for b in blocks]
     assert kinds == ['image', 'audio']
+
+
+def test_rule_line_color_is_argb_uint32():
+    from onenote_tool.parser import _rule_line_color
+    # Real values: default light blue, and the "orange" page.
+    assert _rule_line_color({'body': _FakeBody([(0x14001CD5, b'\xfd\xeb\xca\xff')])}) == '#caebfd'
+    assert _rule_line_color({'body': _FakeBody([(0x14001CD5, b'\xc8\xe0\xf8\xff')])}) == '#f8e0c8'
+    assert _rule_line_color({'body': _FakeBody([])}) is None
+    assert _rule_line_color(None) is None

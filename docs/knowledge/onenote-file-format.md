@@ -37,12 +37,10 @@ Key structural facts, all verified empirically against real files:
 
 - **A `FileNode`'s own position in the file (`ref.stp`, or the node's own
   start offset for an inline-`baseType` node) is structural — real,
-  unencrypted plaintext, even inside a password-protected section.** Only a
-  PropertySet's own property *values* are ever real ciphertext. This
-  distinction is the entire basis for this tool's protected-content
-  recovery — see
-  [ms-offcrypto-encryption.md](ms-offcrypto-encryption.md) and
-  [recovery-techniques-log.md](recovery-techniques-log.md).
+  unencrypted plaintext, even inside a password-protected section.** Only
+  each object's PropertySet body and each embedded file's payload are
+  ciphertext — see
+  [ms-offcrypto-encryption.md](ms-offcrypto-encryption.md).
 - **A page's declarations sit contiguously, in file-position order.** A
   page's `jcidPageMetaData` (its title), `jcidRichTextOENode`s (its body
   runs), and file/ink declarations are laid out one after another, ending
@@ -259,61 +257,54 @@ Absolute coordinate units for ink points are not documented anywhere
 scale (auto-fit SVG viewBox), not matched to any particular page pixel
 size.
 
-### Revision-store duplication
+### Revisions and revision contexts (where the "duplication" comes from)
 
-A `.one` file is not a clean single snapshot — OneNote's on-disk format is
-itself a **revision store**: editing a page over time leaves multiple
-generations of its objects in the file, not just the current one. Verified
-directly: the SAME logical text run or title can appear at 20+ different
-`oid` revision-counter values, scattered across the file. Two shapes this
-takes, both confirmed against real files:
+A `.one` file is a revision store. Its structure, as read by this tool:
 
-- **Widely-separated clusters.** A stale/superseded generation's
-  declarations can sit in an entirely different region of the file,
-  megabytes away from the live generation's — a gap far larger than any
-  legitimate same-page proximity. (This tool uses exactly that gap size as
-  a signal — see
-  [recovery-techniques-log.md](recovery-techniques-log.md).)
-- **Interleaved near-duplicates.** A stale generation can *also* land
-  right next to (structurally "inside the window of") a completely
-  different, unrelated live page — not just its own page's stale copy.
-  This is the harder case, and not fully solved — see the same log for
-  what was tried.
+```
+root FileNodeList
+  ObjectSpaceManifestListReferenceFND (gosid)        one per object space
+    RevisionManifestListReferenceFND
+      RevisionManifestStart6FND / 7FND (rid, ridDependent, role, [gctxid])
+        ObjectGroupListReferenceFND -> object declarations of this revision
+        RootObjectReference3FND ...
+      RevisionManifestEndFND
+      ... more revisions ...
+```
 
-This isn't only a password-protected-recovery problem — the manifest tree
-(`ordering._page_content_order`'s tree walk, used for content order/title
-detection) has its own revision-store failure mode: a stale, superseded
-`jcidPageManifestNode` generation can structurally claim (via its own
-child-reference properties) content that legitimately belongs to a
-different, current page's manifest.
+Each page is one object space; the section has its own space(s) too (page
+series, TOC cache). A revision with no context id (`6FND`, or `7FND` with a
+nil `gctxid`) is in the **default context** — the page as it is now.
+Revisions in other contexts are:
 
-**Tried and reverted (0.1.1)**: an earlier version had `parser.parse_one_file`
-trust that tree walk to override a run's own `_run_guid` (its
-`TextRunFormatting`-derived object-space guid) whenever the two disagreed,
-reasoning that the tree was the more authoritative signal for "which page is
-this run really on." A/B testing against the verified-working pre-extraction
-code on a real notebook found the opposite: the tree walk's own failure mode
-above made it claim a run that belonged to a genuinely separate page,
-silently **dropping that page entirely** from the output (not just
-misattributing a run — the whole page, title included, vanished). See
-[known-limitations.md](known-limitations.md) for the full account. Current
-behavior (matches the verified baseline): group a run purely by its own
-`_run_guid`, no tree-based override. `ordering._page_content_order`'s walk
-also deliberately uses a narrower child-key set (`_CONTENT_CHILD_KEYS`) than
-`_object_space_order`'s (`_ORDER_CHILD_KEYS`) — widening it to match was
-part of what let the walk cross into the wrong page's subtree.
+- **page version history**: one context per saved older version of the
+  page, each a complete snapshot (its own PageNode, TitleNode,
+  PageMetaData, runs) — commonly more than half of a section's
+  declarations, and where old titles and deleted text live;
+- one shared context `7111497f-1b6b-4209-9491-c98b04cf4c5a`:
+  `jcidVersionHistoryMetaData`, `jcidVersionHistoryContent`,
+  `jcidVersionProxy` bookkeeping.
 
-- **Still open: which title snapshot is current.** Page titles have the same
-  duplication problem `page_title_by_guid` doesn't yet resolve: a renamed
-  page can leave both its old and new `CachedTitleString` snapshots in the
-  file under the exact same `(guid, revision)` identity tuple pyOneNote
-  exposes — no ordering signal currently available (revision counter,
-  timestamp) reliably distinguishes which is current. First-occurrence-wins
-  (today's behavior) is right on some real pages and stale on others in the
-  *same file* — there's no consistent direction to flip the tiebreak in
-  without a real signal to key it on. Left as a known gap rather than
-  guessed at; see
-  [known-limitations.md](known-limitations.md).
+On every real notebook checked, each page had exactly one default-context
+revision and every `ridDependent` was nil (each revision is self-contained),
+but the reader follows a dependency chain if one is present. OneNote's own
+MHT export contains only default-context content.
+
+pyOneNote flattens all of this into one list of declarations; that is the
+"revision-store duplication" earlier versions of this tool fought with
+heuristics (stale titles, runs grouped under another page, spurious extra
+pages). `_patches._get_properties` now returns only each object space's
+current revision, tagged with its object space, and `parser.py` assigns
+content to pages by object space. See
+[known-limitations.md](known-limitations.md) for the before/after numbers.
+
+**History (kept because the reasoning still applies):** an earlier version
+had `parser.parse_one_file` let the manifest tree walk override a run's own
+`_run_guid` whenever the two disagreed. On a real notebook the walk crossed
+into another page's subtree via a stale manifest generation — itself a
+snapshot artifact — and dropped a whole page. Reverted in 0.1.1. The
+object-space attribution that replaced both doesn't depend on any
+reference resolving.
 
 ### Page/section ordering
 

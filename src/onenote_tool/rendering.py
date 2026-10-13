@@ -448,10 +448,51 @@ def _author_attr(author: Optional[str]) -> str:
     return f' data-author="{html.escape(author)}"' if author else ''
 
 
+# NoteTagShape values with a checkbox (verified on real notebooks: every
+# "To Do"-style tag, in any UI language, uses shape 3; ActionItemStatus bit 0
+# and a non-zero NoteTagCompleted agree on which ones are ticked).
+_CHECKBOX_TAG_SHAPES = {3}
+
+
+def _note_tags(val, by_id) -> list:
+    """A paragraph's note tags (To Do, Important, ...) from its
+    `NoteTagStates`, each as {'label', 'checkbox', 'checked'}. The label and
+    shape come from the referenced jcidNoteTagSharedDefinitionContainer."""
+    tags = []
+    for state in val.get('NoteTagStates') or []:
+        if not isinstance(state, dict):
+            continue
+        refs = state.get('NoteTagDefinitionOid') or []
+        definition = by_id.get(_norm_identity(refs[0])) if refs else None
+        dval = definition.get('val', {}) if definition else {}
+        label = _clean_text(str(dval.get('NoteTagLabel') or '')).strip()
+        checkbox = _le_int(dval.get('NoteTagShape'), -1) in _CHECKBOX_TAG_SHAPES
+        checked = bool(_le_int(state.get('ActionItemStatus'), 0) & 1)
+        tags.append({'label': label, 'checkbox': checkbox, 'checked': checked})
+    return tags
+
+
+def _tags_html(tags) -> str:
+    """Leading marker(s) for a tagged paragraph: a checkbox glyph for
+    checkbox tags, the label in brackets otherwise — each wrapped in a span
+    carrying the tag's label (and checked state) for consumers to restyle."""
+    out = []
+    for tag in tags or []:
+        label = html.escape(tag['label'])
+        if tag['checkbox']:
+            checked = 'true' if tag['checked'] else 'false'
+            glyph = '☑' if tag['checked'] else '☐'  # ballot box with check / ballot box
+            out.append(f'<span class="onenote-tag" data-tag="{label}" data-checked="{checked}">{glyph}</span> ')
+        elif label:
+            out.append(f'<span class="onenote-tag" data-tag="{label}">[{label}]</span> ')
+    return ''.join(out)
+
+
 def _runs_to_paragraphs(runs: list) -> str:
     """Each run is a dict {'t': plain text, 'h': inline html or None, 'yt': ...,
     'list': {'ordered', 'level'} or absent, 'align': 'center'|'right' or absent,
-    'author': real display name or absent (see parser.py's `author_by_run`)}."""
+    'author': real display name or absent (see parser.py's `author_by_run`),
+    'tags': note tags or absent (see `_note_tags`)}."""
     parts = []
     pending = []  # consecutive list items -> one <ul>/<ol>
 
@@ -480,7 +521,7 @@ def _runs_to_paragraphs(runs: list) -> str:
         if not inner:
             continue
         fmt = run.get('fmt')
-        inner = _apply_marks(inner, fmt)
+        inner = _tags_html(run.get('tags')) + _apply_marks(inner, fmt)
         attrs = _align_attr(run.get('align')) + _author_attr(run.get('author'))
         li = run.get('list')
         if li:
@@ -565,6 +606,9 @@ def _collect_cell_runs(nid, by_id, consumed, list_runs, image_builder, images, a
         author = (author_by_run or {}).get(nid)
         if author:
             entry['author'] = author
+        tags = _note_tags(val, by_id)
+        if tags:
+            entry['tags'] = tags
         align = _paragraph_alignment(val.get('ParagraphAlignment'))
         if align:
             entry['align'] = align

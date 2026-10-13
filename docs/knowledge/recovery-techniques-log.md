@@ -8,8 +8,14 @@ current approach; several tempting-looking alternatives below were already
 tried and are dead ends, for reasons that aren't obvious until you've hit
 them on a real file.
 
-All of this assumes the encryption itself is already solved — see
-[ms-offcrypto-encryption.md](ms-offcrypto-encryption.md).
+> **Historical.** Everything below was worked out against an earlier,
+> wrong model of the encryption (whole-file segmented decryption), which
+> only ever decrypted objects partially. The real per-object format is now
+> decrypted exactly (see
+> [ms-offcrypto-encryption.md](ms-offcrypto-encryption.md)), protected
+> sections go through the normal pipeline with full parity, and
+> `recovery.py`'s structural recovery is only a last-resort fallback. Kept
+> as the record of why that fallback looks the way it does.
 
 ## The core problem
 

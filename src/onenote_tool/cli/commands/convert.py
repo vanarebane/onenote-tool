@@ -29,12 +29,17 @@ def convert(
         help='Password for a protected section, e.g. --section-password "My Section"=hunter2 '
              '(repeatable for multiple protected sections)',
     ),
+    offline: bool = typer.Option(
+        False, '--offline', help="Make no network requests (skips matching YouTube thumbnails to embedded previews)",
+    ),
 ) -> None:
     """Convert a whole .onepkg notebook and print a per-element report."""
     if not os.path.exists(onepkg):
         typer.echo(f'File not found: {onepkg}', err=True)
         raise typer.Exit(1)
 
+    if offline:
+        os.environ['ONENOTE_TOOL_OFFLINE'] = '1'
     passwords = dict(_parse_section_password(v) for v in section_password) or None
     result = convert_onepkg(onepkg, work_dir=work_dir, section_passwords=passwords)
 
